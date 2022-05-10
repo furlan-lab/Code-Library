@@ -1,0 +1,106 @@
+#Fast QC
+#trim 
+#Fast QC 
+
+module load R
+ml SRA-Toolkit
+module load cutadapt
+module load TrimGalore
+module load FastQC
+
+
+cd /fh/fast/furlan_s/user/owalt/ewings/CNR
+
+##CHP
+tab<-"/fh/fast/furlan_s/user/owalt/ewings/CNR/sra.csv" 
+td<-read.csv(tab) 
+td<-td[!grepl("ChIP", td$LibrarySelection),] 
+td$Run 
+system('fastq-dump -X 5 -Z SRR11000269')
+
+for(srr in td$Run){
+	command<-sprintf("sbatch -n 1 -c 1 -p campus-new -M gizmo --wrap='fastq-dump --split-files --gzip -O /fh/fast/furlan_s/user/owalt/ewings/CNR/sra-cache/sra/fastq %s'", srr)
+	system(command)
+}
+
+cd /fh/fast/furlan_s/user/owalt/ewings/CNR/sra-cache/sra/fastq
+
+##CHECK WITH ONE FILE THAT IT WORKS
+##in bash
+
+fastqc SRR11006178_1.fastq.gz
+
+trimmed_galore SRR11006178_1.fastq.gz
+
+fastqc SRR11006178_1_trimmed.fastq.qz
+
+##TRIM ALL C&R/T DATA TO PREPARE FOR BOW TIE, have to run in pairs
+R
+
+td <- read.csv(file = "/fh/fast/furlan_s/user/owalt/ewings/CNR/SraRunTable.txt")
+apath<-file.path("/fh/fast/furlan_s/user/owalt/ewings/CNR/sra-cache/sra/fastq", paste0(td[!grepl("ChIP", td$LibrarySelection),]$Run, "_1", ".fastq.gz"))
+file.exists(apath)
+
+bpath<-file.path("/fh/fast/furlan_s/user/owalt/ewings/CNR/sra-cache/sra/fastq", paste0(td[!grepl("ChIP", td$LibrarySelection),]$Run, "_2", ".fastq.gz"))
+file.exists(bpath)
+
+
+for(i in 1:length(apath)){
+	out <- file.path("/fh/fast/furlan_s/user/owalt/ewings/CNR/sra-cache/sra/fastq/trimmed")
+	command<- sprintf("sbatch -n 1 -c 1 -p campus-new -M gizmo --wrap='trim_galore --fastqc --gzip --output_dir %s %s'", out, apath[i]) 
+	system(command)
+}
+
+for(i in 1:length(bpath)){
+	out <- file.path("/fh/fast/furlan_s/user/owalt/ewings/CNR/sra-cache/sra/fastq/trimmed")
+	command<- sprintf("sbatch -n 1 -c 1 -p campus-new -M gizmo --wrap='trim_galore --fastqc --gzip --output_dir %s %s'", out, bpath[i]) 
+	system(command)
+}
+
+###
+#Build Bowie Genome Index, already did this so no need to do again
+
+cd "/fh/fast/furlan_s/grp/refs/GRCh38"
+
+module load Bowtie2/2.4.2-GCC-10.2.0
+
+bowtie2-build GRCh38.p13.genome.fa GRh38_Bowtie
+
+##
+#realign trimmed fastq files to bowtie index
+
+ml R
+ml SAMtools/1.10-GCCcore-8.3.0
+module load Bowtie2/2.4.1-GCCcore-8.3.0
+R
+
+
+tab<-"/fh/fast/furlan_s/user/owalt/ewings/CNR/sra.csv" 
+td<-read.csv(tab) 
+td<-td[!grepl("ChIP", td$LibrarySelection),] 
+
+apath<-file.path("/fh/fast/furlan_s/user/owalt/ewings/CNR/sra-cache/sra/fastq", paste0(td[,]$Run, "_1.fastq.gz"))
+file.exists(apath)
+bpath<-file.path("/fh/fast/furlan_s/user/owalt/ewings/CNR/sra-cache/sra/fastq", paste0(td[,]$Run, "_2.fastq.gz"))
+file.exists(bpath)
+aname<-paste0(td[,]$Run, td$cell_line, ".sam")
+
+
+
+for(i in 1:length(apath)){
+	command <- sprintf("sbatch -n 1 -c 1 -p campus-new -M gizmo --wrap='bowtie2 -x /fh/fast/furlan_s/grp/refs/GRCh38/bowtie2/GRh38_Bowtie -1 %s -2 %s -S %s'", apath[i], bpath[i], aname[i])
+	system(command)
+}
+
+bowtie2 -x /fh/fast/furlan_s/grp/refs/GRCh38/bowtie2/GRh38_Bowtie -U SRR11000269_trimmed.fq.gz -S SRR11000269_trimmed.sam
+#works
+
+
+
+
+bowtie2 -x GRh38_Bowtie -U /fh/fast/furlan_s/user/owalt/ewings/ChIP/sra-cache/sra -S 
+
+
+
+
+

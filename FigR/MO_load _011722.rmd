@@ -1,0 +1,716 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+screen
+grabnode
+24
+480
+7
+N
+
+ml R/4.1.0-foss-2020b
+
+R
+
+```{R}
+rm(list=ls())
+
+.libPaths(c("/home/owaltner/R/x86_64-pc-linux-gnu-library/4.0",
+"/app/software/fhR/4.0.2-foss-2019b",
+"/app/software/V8/3.4.0-foss-2019b-R-4.0.2",
+"/app/software/R/4.0.2-foss-2019b/lib/R/library"))
+
+
+.libPaths(c("/home/owaltner/R/x86_64-pc-linux-gnu-library/4.1",
+"/app/software/fhR/4.1.0-foss-2020b",
+"/app/software/R/4.1.0-foss-2020b/lib/R/library"))
+
+suppressPackageStartupMessages({
+  # Plotting packages
+  library(viridis)
+  library(wesanderson)
+  library(RColorBrewer)
+  library(circlize)
+  library(ComplexHeatmap)
+  library(patchwork)
+  library(gplots)
+  library(grid)
+  library(ggplot2)
+  library(ggrepel)
+  library(ggrastr)
+  library(ggdendro)
+  library(ggthemes)
+  library(gghighlight)
+  
+  # Tidy data packages
+  
+  library(dplyr)
+  library(magrittr)
+  library(reshape2)
+  library(splitstackshape)
+  library(broom)
+  library(stringr)
+  library(binr)
+  library(tibbletime)
+  library(Matrix)
+
+  # Statistics packages
+  
+  library(e1071)
+  library(fclust)
+  
+  # Bioinformatics packages
+  
+  library(org.Hs.eg.db)
+  library(clusterProfiler)
+  library(SingleCellExperiment)
+  library(GenomicInteractions)
+  library(GenomicRanges)
+  library(motifmatchr)
+  library(TFBSTools)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  # library(URD)
+  library(Seurat)
+  library(xfun)
+  library(rhdf5)
+  library(Signac)
+  library(future)
+  library(EnsDb.Hsapiens.v86)
+  library(JASPAR2020)
+  library(ArchR)
+  library(parallel)
+  library(scCustomize)
+  library(SeuratObject)
+  library(Seurat)
+  library(foreach)
+  library(chromVAR)
+  library(chromVARmotifs)
+})
+
+set.seed(1234)
+
+setwd("~/m2")
+m2<-loadArchRProject()
+m2_seu<-readRDS("~/m2/m2.rds")
+
+link_df<- read.csv("~/m2/res/3_subgroup_links.csv")
+
+library(future)
+plan()
+
+plan("multicore", workers = detectCores())
+plan()
+
+options(future.globals.maxSize = 360 * 1024 ^ 3) # for 50 Gb RAM
+
+
+pdf("test.pdf")
+DimPlot(m2_seu, reduction = "mo_UMAP")
+dev.off()
+
+
+##load hg38 gene tss range file
+
+hg38TSSRanges <- readRDS("~/refTSS_hg38.rds")
+hg38TSSRanges$gene_name <- hg38TSSRanges$Gene_symbol
+hg38TSSRanges<- hg38TSSRanges[which(!is.na(hg38TSSRanges$gene_name))]
+```
+
+#9CL set up
+```{R}
+##get peak set from ArchR then normalize ATAC matrix with Signac standard workflow
+
+ATAC.se<- getMatrixFromProject(
+  ArchRProj = m2,
+  useMatrix = "PeakMatrix",
+  useSeqnames = NULL,
+  verbose = TRUE,
+  binarize = FALSE,
+  threads = getArchRThreads(),
+  logFile = createLogFile("getMatrixFromProject")
+)
+
+cts<-assays(ATAC.se)$PeakMatrix
+peak<-GRangesToString(getPeakSet(m2))
+rownames(cts)<-peak
+colnames(cts)<-gsub("#", "_", colnames(cts))
+atac<-CreateSeuratObject(counts = cts, assay = "ATAC", meta.data = data.frame(m2@cellColData))
+atac <- RunTFIDF(atac)
+atac <- FindTopFeatures(atac, min.cutoff = 'q0')
+atac <- RunSVD(atac)
+dim(atac)
+colnames(atac[["ATAC"]]@data)
+rownames(atac@meta.data)
+ranges<-getPeakSet(m2)
+names(ranges)<-NULL
+
+ATAC.se <- SummarizedExperiment(assays = list(counts = atac[["ATAC"]]@data) , rowRanges =ranges, colData = atac@meta.data)
+
+saveRDS(ATAC.se, "~/m2/res/ATACse.rds")
+
+
+
+ATAC.se<-readRDS("/Volumes/owaltner/m2/res/ATACse.rds")
+
+RNAmat<- m2_seu[,which(m2_seu$subgroup == "group.2")][["RNA"]]@data %>% as.sparse()
+
+# run GenePeakcorr for dataset, will be used for 9Cl and IC_EWS analysis
+cisCor <- runGenePeakcorr(ATAC.se = ATAC.se,
+                           RNAmat = RNAmat,
+                           genome = "hg38",
+                          windowPadSize = 50000,
+                           nCores = detectCores(),
+                           n_bg = 100,
+                           p.cut = NULL)
+#write.csv(cisCor, file.path("~/m2/res/cisCOR_figR_9CL.csv"))
+#cisCor<- read.csv(file.path("~/m2/res/cisCOR_figR_9CL.csv"))
+```
+```{R}
+RNAmat<- m2_seu[["RNA"]]@data %>% as.sparse()
+
+cisCor.filt <- cisCor %>% dplyr::filter(pvalZ <= 0.05)
+
+pdf("dorc_plot.pdf")
+dorcGenes <- dorcJplot(dorcTab = cisCor.filt,
+                       cutoff =4,
+                       returnGeneList = TRUE)
+dev.off()
+
+
+sigGP <- cisCor.filt[cisCor.filt$Gene %in% dorcGenes,]
+
+rownames(RNAmat) <- gsub(x=rownames(RNAmat),pattern = "-",replacement = "",fixed = TRUE)
+
+dorcMat<- getDORCScores(ATAC.se, dorcTab = sigGP, geneList = dorcGenes)
+
+colnames(dorcMat)
+
+m2<- loadArchRProject("~/m2")
+
+lsi <- m2@reducedDims@listData$mo@listData$matRD
+
+rownames(lsi)<- gsub("#", "_",rownames(lsi) )
+
+lsi <- lsi[which(rownames(lsi) %in% colnames(dorcMat)),]
+dorcMat <- dorcMat[,which(colnames(dorcMat) %in% rownames(lsi))]
+ATAC.se <- ATAC.se[, which(colnames(ATAC.se) %in% rownames(lsi))]
+RNAmat <- RNAmat[, which(colnames(RNAmat) %in% rownames(lsi))]
+
+
+lsi.knn <- FNN::get.knn(lsi,k=30)$nn.index
+rownames(lsi.knn) <- colnames(dorcMat)
+
+library(doParallel)
+dorcMat.smoothed <- smoothScoresNN(lsi.knn,dorcMat,nCores = detectCores())
+saveRDS(dorcMat.smoothed, file.path("~/m2/res/dorcMat_smoothed_9CL.rds"))
+
+
+rownames(dorcMat.smoothed)<- dorcGenes
+# Just so that the smoothing function will work, since it checks for matching attributes
+rownames(lsi.knn) <- colnames(RNAmat)
+
+# Run only on TFs to save time
+human_pwms_v3 <- readRDS("~/cisBP_human_pfms_2021.rds")
+rnaMat.smoothed <- smoothScoresNN(NNmat = lsi.knn,TSSmat = RNAmat,nCores = detectCores(),geneList=intersect(rownames(RNAmat),names(human_pwms_v3)))
+gc()
+
+saveRDS(rnaMat.smoothed , file.path("~/m2/res/rnaMat_smoothed_9CL.rds"))
+
+
+```
+
+#group2 set up
+```{R}
+ATAC.se<- getMatrixFromProject(
+  ArchRProj = m2[which(m2$subgroup == "group.2"),],
+  useMatrix = "PeakMatrix",
+  useSeqnames = NULL,
+  verbose = TRUE,
+  binarize = FALSE,
+  threads = getArchRThreads(),
+  logFile = createLogFile("getMatrixFromProject")
+)
+
+cts<-assays(ATAC.se)$PeakMatrix
+peak<-GRangesToString(getPeakSet(m2))
+rownames(cts)<-peak
+colnames(cts)<-gsub("#", "_", colnames(cts))
+atac<-CreateSeuratObject(counts = cts, assay = "ATAC", meta.data = data.frame(m2[which(m2$subgroup == "group.2"),]@cellColData))
+atac <- RunTFIDF(atac)
+atac <- FindTopFeatures(atac, min.cutoff = 'q0')
+atac <- RunSVD(atac)
+dim(atac)
+colnames(atac[["ATAC"]]@data)
+rownames(atac@meta.data)
+ranges<-getPeakSet(m2)
+names(ranges)<-NULL
+
+ATAC.se <- SummarizedExperiment(assays = list(counts = atac[["ATAC"]]@data) , rowRanges =ranges, colData = atac@meta.data)
+
+saveRDS(ATAC.se, "~/m2/res/ATACse_group2.rds")
+RNAmat<- m2_seu[,which(m2_seu$subgroup == "group.2")][["RNA"]]@data %>% as.sparse()
+
+# run GenePeakcorr for dataset, will be used for 9Cl and IC_EWS analysis
+cisCor <- runGenePeakcorr(ATAC.se = ATAC.se,
+                           RNAmat = RNAmat,
+                           genome = "hg38",
+                          windowPadSize = 50000,
+                           nCores = detectCores(),
+                           n_bg = 100,
+                           p.cut = NULL)
+#write.csv(cisCor, file.path("~/m2/res/cisCOR_figR_group2.csv"))
+cisCor.filt <- cisCor %>% dplyr::filter(pvalZ <= 0.05)
+
+pdf("dorc_plot_group2.pdf")
+dorcGenes <- dorcJplot(dorcTab = cisCor.filt,
+                       cutoff =4,
+                       returnGeneList = TRUE)
+dev.off()
+
+
+sigGP <- cisCor.filt[cisCor.filt$Gene %in% dorcGenes,]
+
+rownames(RNAmat) <- gsub(x=rownames(RNAmat),pattern = "-",replacement = "",fixed = TRUE)
+
+dorcMat<- getDORCScores(ATAC.se, dorcTab = sigGP, geneList = dorcGenes)
+
+colnames(dorcMat)
+
+m2<- loadArchRProject("~/m2")
+
+lsi <- m2[which(m2$subgroup == "group.2"),]@reducedDims@listData$mo@listData$matRD
+
+rownames(lsi)<- gsub("#", "_",rownames(lsi) )
+
+lsi <- lsi[which(rownames(lsi) %in% colnames(dorcMat)),]
+dorcMat <- dorcMat[,which(colnames(dorcMat) %in% rownames(lsi))]
+ATAC.se <- ATAC.se[, which(colnames(ATAC.se) %in% rownames(lsi))]
+RNAmat <- RNAmat[, which(colnames(RNAmat) %in% rownames(lsi))]
+
+
+lsi.knn <- FNN::get.knn(lsi,k=30)$nn.index
+rownames(lsi.knn) <- colnames(dorcMat)
+
+library(doParallel)
+dorcMat.smoothed <- smoothScoresNN(lsi.knn,dorcMat,nCores = detectCores())
+saveRDS(dorcMat.smoothed, file.path("~/m2/res/dorcMat_smoothed_group2.rds"))
+
+
+rownames(dorcMat.smoothed)<- dorcGenes
+# Just so that the smoothing function will work, since it checks for matching attributes
+rownames(lsi.knn) <- colnames(RNAmat)
+
+# Run only on TFs to save time
+human_pwms_v3 <- readRDS("~/cisBP_human_pfms_2021.rds")
+rnaMat.smoothed <- smoothScoresNN(NNmat = lsi.knn,TSSmat = RNAmat,nCores = detectCores(),geneList=intersect(rownames(RNAmat),names(human_pwms_v3)))
+gc()
+
+saveRDS(rnaMat.smoothed , file.path("~/m2/res/rnaMat_smoothed_group2.rds"))
+```
+
+#group3 set up
+```{R}
+ATAC.se<- getMatrixFromProject(
+  ArchRProj = m2[which(m2$subgroup == "group.3"),],
+  useMatrix = "PeakMatrix",
+  useSeqnames = NULL,
+  verbose = TRUE,
+  binarize = FALSE,
+  threads = getArchRThreads(),
+  logFile = createLogFile("getMatrixFromProject")
+)
+
+cts<-assays(ATAC.se)$PeakMatrix
+peak<-GRangesToString(getPeakSet(m2))
+rownames(cts)<-peak
+colnames(cts)<-gsub("#", "_", colnames(cts))
+atac<-CreateSeuratObject(counts = cts, assay = "ATAC", meta.data = data.frame(m2[which(m2$subgroup == "group.3"),]@cellColData))
+atac <- RunTFIDF(atac)
+atac <- FindTopFeatures(atac, min.cutoff = 'q0')
+atac <- RunSVD(atac)
+dim(atac)
+colnames(atac[["ATAC"]]@data)
+rownames(atac@meta.data)
+ranges<-getPeakSet(m2)
+names(ranges)<-NULL
+
+ATAC.se <- SummarizedExperiment(assays = list(counts = atac[["ATAC"]]@data) , rowRanges =ranges, colData = atac@meta.data)
+
+saveRDS(ATAC.se, "~/m2/res/ATACse_group3.rds")
+RNAmat<- m2_seu[,which(m2_seu$subgroup == "group.3")][["RNA"]]@data %>% as.sparse()
+
+cisCor <- runGenePeakcorr(ATAC.se = ATAC.se,
+                           RNAmat = RNAmat,
+                           genome = "hg38",
+                          windowPadSize = 50000,
+                           nCores = detectCores(),
+                           n_bg = 100,
+                           p.cut = NULL)
+#write.csv(cisCor, file.path("~/m2/res/cisCOR_figR_group3.csv"))
+cisCor.filt <- cisCor %>% dplyr::filter(pvalZ <= 0.05)
+
+pdf("dorc_plot_group3.pdf")
+dorcGenes <- dorcJplot(dorcTab = cisCor.filt,
+                       cutoff =4,
+                       returnGeneList = TRUE)
+dev.off()
+
+
+sigGP <- cisCor.filt[cisCor.filt$Gene %in% dorcGenes,]
+
+rownames(RNAmat) <- gsub(x=rownames(RNAmat),pattern = "-",replacement = "",fixed = TRUE)
+
+dorcMat<- getDORCScores(ATAC.se, dorcTab = sigGP, geneList = dorcGenes)
+
+colnames(dorcMat)
+
+m2<- loadArchRProject("~/m2")
+
+lsi <- m2[which(m2$subgroup == "group.3"),]@reducedDims@listData$mo@listData$matRD
+
+rownames(lsi)<- gsub("#", "_",rownames(lsi) )
+
+lsi <- lsi[which(rownames(lsi) %in% colnames(dorcMat)),]
+dorcMat <- dorcMat[,which(colnames(dorcMat) %in% rownames(lsi))]
+ATAC.se <- ATAC.se[, which(colnames(ATAC.se) %in% rownames(lsi))]
+RNAmat <- RNAmat[, which(colnames(RNAmat) %in% rownames(lsi))]
+
+
+lsi.knn <- FNN::get.knn(lsi,k=30)$nn.index
+rownames(lsi.knn) <- colnames(dorcMat)
+
+library(doParallel)
+dorcMat.smoothed <- smoothScoresNN(lsi.knn,dorcMat,nCores = detectCores())
+saveRDS(dorcMat.smoothed, file.path("~/m2/res/dorcMat_smoothed_group3.rds"))
+
+
+rownames(dorcMat.smoothed)<- dorcGenes
+# Just so that the smoothing function will work, since it checks for matching attributes
+rownames(lsi.knn) <- colnames(RNAmat)
+
+# Run only on TFs to save time
+human_pwms_v3 <- readRDS("~/cisBP_human_pfms_2021.rds")
+rnaMat.smoothed <- smoothScoresNN(NNmat = lsi.knn,TSSmat = RNAmat,nCores = detectCores(),geneList=intersect(rownames(RNAmat),names(human_pwms_v3)))
+gc()
+
+saveRDS(rnaMat.smoothed , file.path("~/m2/res/rnaMat_smoothed_group3.rds"))
+```
+
+#IC_EWS set up
+```{R}
+aynaud<-read.delim("~/m1/ICEWS_genes.txt")
+
+pdf("~/m2/res/dorc_plot_IC_EWS.pdf")
+dorcGenes <- dorcJplot(dorcTab = cisCor,
+                       cutoff =0,
+                       returnGeneList = TRUE)
+dev.off()
+
+sigGP <- cisCor[cisCor$Gene %in% aynaud$Gene,]
+dorcGenes<- unique(cisCor[cisCor$Gene %in% aynaud$Gene,]$Gene)
+
+
+
+
+rownames(RNAmat) <- gsub(x=rownames(RNAmat),pattern = "-",replacement = "",fixed = TRUE)
+
+dorcMat<- getDORCScores(ATAC.se, dorcTab = sigGP, geneList = dorcGenes)
+
+colnames(dorcMat)
+
+m2<- loadArchRProject("~/m2")
+
+lsi <- m2@reducedDims@listData$mo@listData$matRD
+
+rownames(lsi)<- gsub("#", "_",rownames(lsi) )
+
+lsi <- lsi[which(rownames(lsi) %in% colnames(dorcMat)),]
+dorcMat <- dorcMat[,which(colnames(dorcMat) %in% rownames(lsi))]
+ATAC.se <- ATAC.se[, which(colnames(ATAC.se) %in% rownames(lsi))]
+RNAmat <- RNAmat[, which(colnames(RNAmat) %in% rownames(lsi))]
+
+
+lsi.knn <- FNN::get.knn(lsi,k=30)$nn.index
+rownames(lsi.knn) <- colnames(dorcMat)
+
+library(doParallel)
+dorcMat.smoothed <- smoothScoresNN(lsi.knn,dorcMat,nCores = detectCores())
+saveRDS(dorcMat.smoothed, file.path("~/m2/res/dorcMat_smoothed_IC_EWS.rds"))
+
+
+rownames(dorcMat.smoothed)<- dorcGenes
+# Just so that the smoothing function will work, since it checks for matching attributes
+rownames(lsi.knn) <- colnames(RNAmat)
+
+# Run only on TFs to save time
+human_pwms_v3 <- readRDS("~/cisBP_human_pfms_2021.rds")
+rnaMat.smoothed <- smoothScoresNN(NNmat = lsi.knn,TSSmat = RNAmat,nCores = detectCores(),geneList=intersect(rownames(RNAmat),names(human_pwms_v3)))
+gc()
+
+saveRDS(rnaMat.smoothed , file.path("~/m2/res/rnaMat_smoothed_IC_EWS.rds"))
+```
+
+
+
+
+#stim_FigR
+
+#load 9CL run FigR
+```{R}
+#9CL
+ATAC.se<-readRDS("/Volumes/owaltner/m2/res/ATACse.rds")
+rnaMat.smoothed<- readRDS("/Volumes/owaltner/m2/res/rnaMat_smoothed_9CL.rds")
+dorcMat.smoothed<- readRDS("/Volumes/owaltner/m2/res/dorcMat_smoothed_9CL.rds")
+cisCor<-read.csv("/Volumes/owaltner/m2/res/cisCOR_figR_9CL.csv")
+
+cisCor.filt <- cisCor %>% dplyr::filter(pvalZ <= 0.05)
+dorcGenes <- dorcJplot(dorcTab = cisCor.filt,
+                       cutoff =4,
+                       returnGeneList = TRUE)
+sigGP <- cisCor.filt[cisCor.filt$Gene %in% dorcGenes,]
+
+stim_FigR <- runFigR(ATAC.se = ATAC.se,
+                           dorcK = 20,
+                           dorcTab = sigGP,
+                           genome = "hg38", 
+                           dorcMat = dorcMat.smoothed,
+                           rnaMat = rnaMat.smoothed,
+                           n_bg = 50,
+                           nCores = detectCores())
+#write.csv(stim_FigR, "/Volumes/owaltner/m2/res/stim_figR_9CL.csv")
+```
+
+#load IC_EWS run FigR
+```{R}
+#IC_EWS
+ATAC.se<-readRDS("/Volumes/owaltner/m2/res/ATACse.rds")
+rnaMat.smoothed<- readRDS("/Volumes/owaltner/m2/res/rnaMat_smoothed_IC_EWS.rds")
+dorcMat.smoothed<- readRDS("/Volumes/owaltner/m2/res/dorcMat_smoothed_IC_EWS.rds")
+cisCor<-read.csv("/Volumes/owaltner/m2/res/cisCOR_figR_9CL.csv")
+aynaud<-read.delim("~/m1/ICEWS_genes.txt")
+
+
+#lowering thresholds to get at as many IC_EWS genes as possible
+sigGP <- cisCor[cisCor$Gene %in% aynaud$Gene,]
+
+stim_FigR <- runFigR(ATAC.se = ATAC.se,
+                           dorcK = 20,
+                           dorcTab = sigGP,
+                           genome = "hg38", 
+                           dorcMat = dorcMat.smoothed,
+                           rnaMat = rnaMat.smoothed,
+                           n_bg = 50,
+                           nCores = detectCores())
+write.csv(stim_FigR, "/Volumes/owaltner/m2/res/stim_figR_IC_EWS.csv")
+```
+
+#load group2 run FigR
+```{R}
+rnaMat.smoothed<- readRDS("/Volumes/owaltner/m2/res/rnaMat_smoothed_group2.rds")
+dorcMat.smoothed<- readRDS("/Volumes/owaltner/m2/res/dorcMat_smoothed_group2.rds")
+ATAC.se<-readRDS("/Volumes/owaltner/m2/res/ATACse_group2.rds")
+cisCor<-read.csv("/Volumes/owaltner/m2/res/cisCOR_figR_group2.csv")
+# ---------------------------------------------------------------------------------- Run FigR
+cisCor.filt <- cisCor %>% dplyr::filter(pvalZ <= 0.05)
+dorcGenes <- dorcJplot(dorcTab = cisCor.filt,
+                       cutoff =4,
+                       returnGeneList = TRUE)
+sigGP <- cisCor.filt[cisCor.filt$Gene %in% dorcGenes,]
+
+stim_FigR <- runFigR(ATAC.se = ATAC.se,
+                           dorcK = 20,
+                           dorcTab = sigGP,
+                           genome = "hg38", 
+                           dorcMat = dorcMat.smoothed,
+                           rnaMat = rnaMat.smoothed,
+                           n_bg = 50,
+                           nCores = detectCores())
+# write.csv(stim_FigR, "/Volumes/owaltner/m2/res/strim_figR_group2.csv")
+```
+
+#ANALYSIS
+```{R}
+library(ggplot2)
+library(ggrastr)
+library(BuenColors)
+
+devtools::install_github("caleblareau/BuenColors")
+
+paletteContinuous("solar_extra")
+
+
+gAll <- ggplot(stim_FigR,aes(Corr.log10P,Enrichment.log10P,color=Score, label = Motif)) + 
+  geom_point_rast(size=0.01,shape=16) +
+  theme_classic() +
+  ylim(c(-3.5,6))+
+  theme(axis.text = element_text(size = 10), axis.title = element_text(size = 15))+
+  scale_color_gradientn(colours =  c("#5E4FA2", "#3288BD" ,"#66C2A5", "#ABDDA4"  ,"gray80", "#FDAE61", "#F46D43", "#D53E4F" ,"#9E0142"),limits=c(-2.5,2.5),oob = scales::squish)+
+  geom_text_repel(data = stim_FigR[abs(stim_FigR$Score) > 1.5 ,], size =4)
+
+
+# Mean plot
+library(ggrepel)
+
+filt<-stim_FigR[abs(stim_FigR$Score) > 1.3, ]
+filt<-na.omit(filt)
+
+rankDrivers(figR.d = filt) 
+rankDrivers(figR.d = stim_FigR) 
+
+
+
+plotfigRHeatmap(figR.d = stim_FigR,
+                             score.cut =1.2,
+                             column_names_gp=gpar(fontsize=8),
+                             show_row_dend = FALSE,
+                             column_names_side = "top",
+                             show_column_dend = F,
+                             cluster_rows = T,
+                             cluster_columns = T,
+                             column_names_rot = 45
+                             )
+
+
+unique(stim_FigR[which(stim_FigR$DORC %in% aynaud$Gene),]$DORC)
+unique(stim_FigR[which(stim_FigR$Motif %in% aynaud$Gene),]$Motif)
+
+# dorcs<-stim_FigR[stim_FigR$Motif == "HOXD13" & stim_FigR$Score > 0.9,]$DORC
+```
+
+
+```{R}
+link_df<- read.csv("/Volumes/owaltner/m2/res/3_subgroup_links.csv")
+k1<- link_df[link_df$kmean == "1",]
+k2<- link_df[link_df$kmean == "2",]
+k3<- link_df[link_df$kmean == "3",]
+
+k1_net<-stim_FigR[which(stim_FigR$DORC %in% k1$gene & abs(stim_FigR$Score) > 1.5),]
+k2_net<-stim_FigR[which(stim_FigR$DORC %in% k2$gene& abs(stim_FigR$Score) > 1.5),]
+k3_net<-stim_FigR[which(stim_FigR$DORC %in% k3$gene& abs(stim_FigR$Score) > 1.5),] 
+
+net_list<-list("k1" = k1_net, "k2"= k2_net,"k3"= k3_net)
+
+names(net_list)
+net_list[[1]]
+
+net_list2 <- lapply(1:length(net_list), function(x){
+ net_list[[x]]$subgroup<- rep(names(net_list)[[x]], length(net_list[[x]]$DORC))
+  net_list[[x]]
+})
+
+df <- do.call("rbind",net_list2)
+df
+
+tf_anno<- table(df$Motif, df$subgroup)
+
+tf_anno<-tf_anno[which(rownames(tf_anno) %in% colnames(figR_heat@matrix)),]
+
+df_anno<- data.frame(row.names = rownames(tf_anno), k1 = tf_anno[,"k1"],k2 = tf_anno[,"k2"],k3 = tf_anno[,"k3"] )
+df_anno[,1:3] <- ifelse(df_anno[,1:3] > 0,1,0)
+
+length(rownames(tf_anno))
+length(colnames(figR_heat@matrix))
+
+library(circlize)
+k1_fun = colorRamp2(c(0, 1), c("gray95", "#3a7814"))
+k2_fun = colorRamp2(c(0, 1), c("gray95", "#f74871"))
+k3_fun = colorRamp2(c(0, 1), c("gray95", "#3140e8"))
+
+ca<-HeatmapAnnotation( df = df_anno, col = list("k1" = k1_fun, "k2" = k2_fun,"k3" = k3_fun ), gp = gpar(col = "gray50"))
+
+# Heatmap 
+figR_heat <- plotfigRHeatmap(figR.d = stim_FigR,
+                             score.cut =2,
+                             DORCs = unique(df$DORC),
+                             column_names_gp=gpar(fontsize=8),
+                             show_row_dend = FALSE,
+                             column_names_side = "top",
+                             show_column_dend = F,
+                             cluster_rows = T,
+                             cluster_columns = T,
+                             column_names_rot = 45,
+                             top_annotation = ca
+                             )
+
+
+
+
+m2_seu<-AddModuleScore(m2_seu, features = list(k2$gene), name = "K2")
+m2_seu<-AddModuleScore(m2_seu, features = list(k3$gene), name = "K3")
+m2_seu<-AddModuleScore(m2_seu, features = list(k1$gene), name = "K1")
+
+p<-DotPlot(m2_seu, features = c("K11", "K21", "K31"), group.by="subgroup")
+
+library(Seurat)
+library(tidyverse)
+library(presto)
+library(ComplexHeatmap)
+library(circlize)
+
+df<- p$data
+head(df)
+
+exp_mat<-df %>% 
+  select(-pct.exp, -avg.exp) %>%  
+  pivot_wider(names_from = id, values_from = avg.exp.scaled) %>% 
+  as.data.frame() 
+    
+row.names(exp_mat) <- exp_mat$features.plot  
+exp_mat <- exp_mat[,-1] %>% as.matrix()
+
+head(exp_mat)
+
+percent_mat<-df %>% 
+  select(-avg.exp, -avg.exp.scaled) %>%  
+  pivot_wider(names_from = id, values_from = pct.exp) %>% 
+  as.data.frame() 
+    
+row.names(percent_mat) <- percent_mat$features.plot  
+percent_mat <- percent_mat[,-1] %>% as.matrix()
+
+head(percent_mat)
+range(percent_mat)
+
+quantile(exp_mat, c(0.1, 0.5, 0.9, 0.99))
+
+col_fun = circlize::colorRamp2(c(-1, 0, 2), viridis(20)[c(1,10, 20)])
+
+
+cell_fun = function(j, i, x, y, w, h, fill){
+          grid.rect(x = x, y = y, width = w, height = h, 
+                    gp = gpar(col = NA, fill = NA))
+          grid.circle(x=x,y=y,r= percent_mat[i, j]/100 * min(unit.c(w, h)),
+                      gp = gpar(fill = col_fun(exp_mat[i, j]), col = NA))}
+
+Heatmap(exp_mat,
+        heatmap_legend_param=list(title="expression"),
+        column_title = "clustered dotplot", 
+        col=col_fun,
+        rect_gp = gpar(type = "none"),
+        cell_fun = cell_fun,
+        row_names_gp = gpar(fontsize = 5),
+        row_km = 4,
+        border = "black")
+
+
+```
+
+
+```{R}
+# D3Network
+plotfigRNetwork(stim_FigR,score.cut = 0.65,DORCs = dorcs)
+
+
+```
+
+
+
+
+
+
+
+
+

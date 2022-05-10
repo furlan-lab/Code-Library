@@ -1,0 +1,2127 @@
+---
+title: FigR
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+#FIGR
+```{r utils figR}
+library(ggrepel)
+library(reshape2)
+library(ggrastr)
+#library(BuenColors)
+library(ComplexHeatmap)
+library(circlize)
+library(networkD3)
+library(GGally)
+library(igraph)
+library(network)
+library(parallel)
+library(foreach)
+library(chromVAR)
+library(Matrix)
+library(matrixStats)
+library(dplyr)
+library(pbmcapply)
+library(SummarizedExperiment)
+library(GenomicRanges)
+library(ggplot2)
+library(ggrepel)
+
+# Script for misc helper functions
+
+### Author: Vinay Kartha
+### Contact: <vinay_kartha@g.harvard.edu>
+### Affiliation: Buenrostro Lab, Department of Stem Cell and Regenerative Biology, Harvard University
+
+splitAndFetch <- function(vec,
+                          delim,
+                          part){
+  if(length(part)==1){
+    sapply(strsplit(as.character(vec),delim,fixed=TRUE),"[[",part) } else {
+      sapply(strsplit(as.character(vec),delim,fixed = TRUE),function(x) paste(x[part],collapse = delim))
+    }
+}
+
+centerCounts <- function(obj,
+                         doInChunks=TRUE,
+                         chunkSize=1000){
+  if(!class(obj) %in% c("SummarizedExperiment","RangedSummarizedExperiment","dgCMatrix","dgeMatrix","Matrix"))
+    stop("Supplied object must be either of class SummarizedExperiment or sparse Matrix ..\n")
+  
+  if(ncol(obj) > 10000)
+    doInChunks <- TRUE
+  
+  if(doInChunks){
+    cat("Centering counts for cells sequentially in groups of size ",
+        chunkSize, " ..\n\n")
+    starts <- seq(1,ncol(obj),chunkSize)
+  } else{
+    starts <- 1
+  }
+  
+  counts.l <- list()
+  
+  for(i in 1:length(starts)){
+    beginning <- starts[i]
+    if(i==length(starts)) # If it's the last one
+    {
+      ending <- ncol(obj)
+    } else {
+      ending <- starts[i]+chunkSize-1
+    }
+    
+    cat("Computing centered counts for cells: ",beginning," to ", ending,"..\n")
+    
+    if(class(obj) == "RangedSummarizedExperiment" | class(obj)=="SummarizedExperiment"){
+      m <- SummarizedExperiment::assay(obj[, beginning:ending])} else {
+        m <- obj[,beginning:ending] # Assumes Matrix format
+      }
+    cellMeans <- Matrix::colMeans(m)
+    cat("Computing centered counts per cell using mean reads in features ..\n\n")
+    # Center cell counts based on its mean RIP count
+    cCounts <- Matrix::t(Matrix::t(m)/cellMeans)
+    
+    counts.l[[i]] <- cCounts
+    
+    gc()
+  }
+  
+  cat("Merging results..\n")
+  centered.counts <- do.call("cbind",counts.l)
+  cat("Done!\n")
+  
+  if(class(obj) == "RangedSummarizedExperiment" | class(obj)=="SummarizedExperiment"){
+    SummarizedExperiment::assay(obj) <- centered.counts
+    return(obj)
+  } else {
+    return(centered.counts)
+  }
+}
+
+NNmat = lsi.knn
+TSSmat<- ATAC.se
+
+smoothScoresNN <- function(NNmat,
+                           TSSmat,
+                           geneList = NULL,
+                           barcodesList=NULL,
+                           nCores = 1)
+{
+  if (is.null(rownames(NNmat)))
+    stop("NN matrix has to have matching cell IDs as rownames\n")
+  if (!all.equal(rownames(NNmat), colnames(TSSmat)))
+    stop("Nearest-neighbor matrix and TSS activity score matrix don't have matching cells ..\n")
+  cat("Number of cells in supplied TSS matrix: ", ncol(TSSmat),
+      "\n")
+  cat("Number of genes in supplied TSS matrix: ", nrow(TSSmat),
+      "\n")
+  cat("Number of nearest neighbors being used per cell for smoothing: ",
+      ncol(NNmat), "\n")
+  if (!is.null(geneList)) {
+    if (!(all(geneList %in% rownames(TSSmat)))) {
+      cat("One or more of the gene names supplied is not present in the TSS matrix provided: \n")
+      cat(geneList[!geneList %in% rownames(TSSmat)], sep = ", ")
+      cat("\n")
+      stop()
+    }
+    cat("Running TSS score smoothing for genes:", geneList,
+        sep = "\n")
+    cat("........\n")
+    TSSmat <- TSSmat[rownames(TSSmat) %in% geneList, ]
+  }
+  else {
+    if(nrow(TSSmat) > 10000){
+      cat("Running smoothing for all genes in TSS matrix! (n = ",
+          nrow(TSSmat), ") This is bound to take more time than querying specific markers ..\n",
+          sep = "")
+    }
+  }
+  opts <- list()
+  pb <- txtProgressBar(min = 0, max = ncol(TSSmat), style = 3)
+  progress <- function(n) setTxtProgressBar(pb, n)
+  opts <- list(progress = progress)
+  time_elapsed <- Sys.time()
+  
+  
+  cl <- parallel::makeCluster(6)
+  doSNOW::registerDoSNOW(cl)
+  
+  if(!is.null(barcodesList)){
+    cat("Subsetting to ",length(barcodesList)," barcodes in dataset..\n")
+    NNmat <- NNmat[barcodesList,]
+  }
+  cat("Running in parallel using ", nCores, "cores ..\n")
+  matL <- foreach::foreach(x=1:nrow(NNmat),.options.snow = opts,.packages = c("Matrix","data.table","dplyr", "SummarizedExperiment")) %dopar% {
+    smoothedScore <- data.table(Matrix::rowMeans(TSSmat[, NNmat[x,]]))
+    rownames(smoothedScore) <- rownames(TSSmat)
+    colnames(smoothedScore) <- rownames(NNmat)[x]
+    smoothedScore
+  }
+  
+  parallel::stopCluster(cl)
+  
+  close(pb)
+  cat("Merging results ..\n")
+  smoothedMat <- dplyr::bind_cols(matL) %>% as.sparse()
+  rownames(smoothedMat) <- rownames(TSSmat)
+  #stopifnot(all.equal(colnames(smoothedMat), colnames(TSSmat)))
+  time_elapsed <- Sys.time() - time_elapsed
+  cat(paste("\nTime Elapsed: ", time_elapsed, units(time_elapsed),
+            "\n"))
+  
+  return(smoothedMat)
+}
+
+motifPeakZtest <- function(peakSet, ### peak_set: vector of peak ids you wish to test for motif enrichment
+                           bgPeaks, ### bg_peaks: matrix of background peak selection iterations by chromVAR
+                           tfMat ### tf: binary matrix of peak by motif
+) {
+  
+  if(nrow(tfMat)!=nrow(bgPeaks))
+    stop("Reference peak set used for TF and background peaks matrix must match..\n")
+  
+  if(!all(peakSet %in% 1:nrow(bgPeaks)))
+    stop("One or more of the provided peak indices are out of the background peak set range ..\n")
+  
+  
+  # get selected peak motif frequencies
+  cat("Getting selected peak motif frequencies ..\n")
+  
+  # get frequency of motifs in test set (observed)
+  p.tab <- Matrix::colMeans(tfMat[peakSet, ])
+  
+  # get the background frequency in peak sets of the same size
+  cat("Getting background peak motif frequencies ..\n")
+  # extract relevant rows (i.e. peakset being tested) from background peak matrix
+  bg.f <- as.matrix(bgPeaks[peakSet, ])
+  
+  # calculate (background) motif frequencies in each iteration of background peaks corresponding to peakset
+  bg.tab <- apply(bg.f[, c(1:ncol(bgPeaks))], 2, function(bg_iter) {
+    
+    b.i <- Matrix::colMeans(tfMat[bg_iter, ])
+    return(b.i)
+    
+  })
+  
+  cat("Calculating empirical p values and z score p values ..\n")
+  
+  # loop over each motif and generate enrichment statistics compared to background
+  m.p <- dplyr::bind_rows(lapply(names(p.tab), function(motif) {
+    
+    # calculate sd and mean frequencies for bg and selected peaks
+    s <- sd(bg.tab[motif, ])
+    bg_freq <- mean(bg.tab[motif, ])
+    
+    z_score <- (p.tab[motif] - bg_freq) / s
+    
+    # generate data.frame object of relevant statistics
+    d <- data.frame(
+      motifID = motif,
+      gene = extractTFNames(motif),
+      motif_obs_freq = p.tab[motif],
+      motif_bg_freq = mean(bg.tab[motif, ]),
+      motif_counts = p.tab[motif] * length(peakSet),
+      emp_pval = 1 - (sum(bg.tab[motif, ] < p.tab[motif]) / ncol(bg.tab)),
+      z_test = z_score,
+      pval.z = 2 * pnorm(-abs(z_score)),
+      signed.log10p = -log10(2 * pnorm(-abs(z_score))) * sign(z_score)
+    )
+    return(d)
+  }))
+  # sort by enrichment pval, motif observed frequency
+  m.p <- dplyr::arrange(m.p,pval.z, motif_obs_freq)
+  # return df of enrichment scores
+  return(m.p)
+}
+
+extractTFNames <- function(motifIDs){
+  if(all(grepl("_",motifIDs,fixed = TRUE))){
+    sapply(strsplit(sapply(strsplit(motifIDs,"_LINE.",fixed=FALSE),"[[",2),"_",fixed=FALSE),"[[",2)
+  } else {
+    message("One or more provided motif IDs do not contain any '_' characters .. returning IDs as is")
+    motifIDs
+  }
+}
+
+all.unique <- function(x){
+  length(x)==length(unique(x))
+}
+
+
+clean_theme <- function(){
+  theme(axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank())
+}
+
+ggcustom<- function(gg,clean=FALSE,splitLeg=TRUE,...){
+  
+  
+  gg <- gg +  theme(plot.background=element_blank(),
+                    panel.border = element_blank(),
+                    axis.text = element_text(color="black",size=5.5),
+                    axis.title = element_text(size=7),
+                    line = element_line(size = 0.235), 
+                    legend.title=element_text(size=7), 
+                    legend.text=element_text(size=5),
+                    ... # Additional optional parameters passed to theme()
+  )
+  
+  if(clean)
+    gg <- gg + clean_theme()
+  
+  if(splitLeg){
+    leg <- cowplot::get_legend(gg)
+    
+    gg <- gg + theme(legend.position="none")
+    
+    print(gg)
+    grid::grid.newpage()
+    grid::grid.draw(leg) } else {
+      print(gg)
+    }
+  
+}
+
+```
+
+```{r DORC functions}
+# Script housing main DORC functions
+
+### Author: Vinay Kartha
+### Contact: <vinay_kartha@g.harvard.edu>
+### Affiliation: Buenrostro Lab, Department of Stem Cell and Regenerative Biology, Harvard University
+
+
+# setwd("<data_analysis_folder>")
+# source("./code/utils.R")
+# 
+# load("./data/hg19_refSeq.Rdata")
+# load(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(parallel)
+library(foreach)
+library(chromVAR)
+library(Matrix)
+library(matrixStats)
+library(dplyr)
+library(pbmcapply)
+library(SummarizedExperiment)
+library(GenomicRanges)
+library(ggplot2)
+library(ggrepel)
+library(chromVAR)
+
+chunkCore <- function(chunk,
+                      A, # ATAC matrix
+                      R, # RNA matrix
+                      O, # Gene-Peak overlap pairing data.frame
+                      met # Correlation method ("spearman" or "pearson")
+){
+  
+  # Get indices of genes and peaks from overlap object for chunk
+  # Assumes query hits are genes and subject hits are peaks in the overlap object
+  geneIndices <- O$Gene[chunk[1]:chunk[2]]
+  peakIndices <- O$Peak[chunk[1]:chunk[2]]
+  
+  pairnames <- cbind(rownames(A)[peakIndices],rownames(R)[geneIndices])
+  
+  uniquegenes <- unique(geneIndices)
+  uniquepeaks <- unique(peakIndices)
+  
+  
+  M1 <- as.matrix(Matrix::t(A[uniquepeaks,,drop=FALSE])) # In case only 1 match, keep matrix structure
+  M2 <- as.matrix(Matrix::t(R[uniquegenes,,drop=FALSE])) # In case only 1 match, keep matrix structure
+  
+  # Peak x Gene correlation matrix, subset by peak-gene pair names to get corresponding correlation vector
+  # NOTE: This correlation call fails if you have maps with just 1 gene / peak. This is unlikely for large chunk sizes
+  cor(x = M1,y = M2,method = met)[pairnames]
+  
+}
+
+PeakGeneCor <- function(ATAC, # Normalized reads in peaks counts (rownames should  be "Peak1","Peak2" etc.)
+                        RNA, # Normalized gene expression counts
+                        OV, # Gene TSS - Peak overlap pairs object (Genes: query, Peaks: subject)
+                        ncores=4,
+                        chunkSize=200,
+                        metric="spearman",
+                        bg=NULL){
+  
+  stopifnot(ncol(ATAC)==ncol(RNA))
+  
+  if(chunkSize > 1000)
+    stop("Do not specify very large chunk sizes. Please use chunkSize < 1000")
+  
+  
+  # Number of total gene-peak pairs to chunk up for parallelization
+  n <- length(OV)
+  starts <- seq(1, n, chunkSize)
+  ends <- starts + chunkSize -1
+  ends[length(ends)] <- n
+
+  
+  OVd <- OV %>% as.data.frame() %>% dplyr::rename("Gene"="queryHits","Peak"="subjectHits")
+  
+  chunkList <- mapply(c, starts, ends, SIMPLIFY = FALSE)
+  
+  time_elapsed <- Sys.time()
+  
+  cat("Running in parallel using ", ncores, "cores ..\n")
+  
+  cat("Computing observed correlations ..\n")
+  
+  corList <- pbmcapply::pbmclapply(X=chunkList,
+                                   FUN=function(x) {chunkCore(chunk=x,A=ATAC,R=RNA,O=OVd,met=metric)},mc.cores = ncores)
+  
+  
+  if(any(unlist(sapply(corList,is.null)))){
+    message("One or more of the chunk processes failed unexpectedly (returned NULL) ..")
+    message("Please check to see you have enough cores/memory allocated")
+    message("Also make sure you have filtered down to non-zero peaks/genes")
+  }
+  
+  OVd$rObs <- unlist(corList)
+  
+  
+  cat("Finished!\n")
+  
+  time_elapsed <- Sys.time() - time_elapsed
+  cat(paste("\nTime Elapsed: ",time_elapsed, units(time_elapsed)),"\n\n")
+  
+  if(!is.null(bg)){
+    n_iter <- ncol(bg)
+    cat("Computing background correlations ..\n")
+    
+    time_elapsed <- Sys.time()
+    
+    bgCor <- foreach(i=1:n_iter,.combine = 'cbind',
+                     .export = c("chunkCore","t"),.packages = c("pbmcapply","Matrix", "SummarizedExperiment")) %do% {
+                       OVdBg <- OVd[,1:2] # Initialize gene-peak pairing to observed
+                       OVdBg$Peak <- bg[OVdBg$Peak,i] # Swap actual peaks with bg peaks for given iteration in pairing
+                       bgCorList <- pbmcapply::pbmclapply(X=chunkList,
+                                                          FUN=function(x) {chunkCore(chunk=x,A=ATAC,R=RNA,O=OVdBg,met=metric)},mc.cores = ncores)
+                       unlist(bgCorList) # Vector of background permuted correlation values for that set of background peaks
+                     }
+    
+    
+    if(sum(is.null(bgCor))!=0 | sum(is.na(bgCor))!=0)
+      stop("One or more of the chunk processes failed unexpectedly (returned NULL) .. Please check to see you have enough cores/m
+           emory allocated")
+    
+    time_elapsed <- Sys.time() - time_elapsed
+    cat(paste("\nTime Elapsed: ",time_elapsed, units(time_elapsed)),"\n\n")
+    
+    colnames(bgCor) <- paste0("rBg",1:ncol(bgCor))
+    OVd <- cbind(OVd,bgCor)
+  }
+  
+  return(OVd)
+}
+
+# Main wrapper function
+runGenePeakcorr <- function(ATAC.se, # SummarizedExperiment object of scATAC data
+                            RNAmat, # Paired normalized scRNA-seq data, with gene names as rownames
+                            genome, # Must be one of "hg19", "mm10", or "hg38"
+                            geneList=NULL, # 2 or more valid gene symbols (if only running on subset of genes)
+                            windowPadSize=50000, # base pairs padded on either side of gene TSS
+                            normalizeATACmat=TRUE, # Whether or not to normalize scATAC counts (default is yes, assumes raw counts)
+                            nCores=4, # Number of cores if parallelization support
+                            n_bg=100, # Number of background peaks to use
+                            p.cut=NULL # Optional, if specified, will only return sig peak-gene hits
+) {
+  
+  stopifnot(inherits(ATAC.se,"RangedSummarizedExperiment"))
+  stopifnot(inherits(RNAmat,c("Matrix","matrix")))
+  
+  if(!all.equal(ncol(ATAC.se),ncol(RNAmat)))
+    stop("Input ATAC and RNA objects must have same number of cells")
+  
+  message("Assuming paired scATAC/scRNA-seq data ..")
+  
+  # Function needs rownames for both matrices or gives error
+  rownames(ATAC.se) <- paste0("Peak",1:nrow(ATAC.se))
+  ATACmat <- assay(ATAC.se) # Rownames preserved
+  
+  # Normalize peak counts
+  if(normalizeATACmat)
+    ATACmat <- centerCounts(ATACmat) # Rownames preserved
+  
+  if(is.null(rownames(RNAmat)))
+    stop("RNA matrix must have gene names as rownames")
+  
+  # Check for peaks/genes with 0 accessibility/expression
+  
+  if(any(Matrix::rowSums(assay(ATAC.se))==0)){
+    message("Peaks with 0 accessibility across cells exist ..")
+    message("Removing these peaks prior to running correlations ..")
+    peaksToKeep <- Matrix::rowSums(assay(ATAC.se))!=0
+    ATAC.se <- ATAC.se[peaksToKeep,] # Subset ranges
+    ATACmat <- ATACmat[peaksToKeep,]
+    message("Important: peak indices in returned gene-peak maps are relative to original input SE")
+  }
+  
+  
+  peakRanges <- granges(ATAC.se) # Peak ranges
+  
+  if(any(Matrix::rowSums(RNAmat)==0)){
+    message("Genes with 0 expression across cells exist ..")
+    message("Removing these genes prior to running correlations ..")
+    genesToKeep <- Matrix::rowSums(RNAmat)!=0
+    RNAmat <- RNAmat[genesToKeep,]
+  }
+  
+  cat("Number of peaks in ATAC data:",nrow(ATACmat),"\n")
+  cat("Number of genes in RNA data:",nrow(RNAmat),"\n")
+  
+  
+  if (!genome %in% c("hg19", "hg38", "mm10"))
+    stop("You must specify one of hg19, hg38 or mm10 as a genome build for currently supported TSS annotations..\n")
+  switch(genome, hg19 = {
+    TSSg <- hg19TSSRanges
+  }, hg38 = {
+    TSSg <- hg38TSSRanges
+  }, mm10 = {
+    TSSg <- mm10TSSRanges
+  })
+  
+  # Keep genes that have annotation and are in RNA matrix
+  names(TSSg) <- as.character(TSSg$gene_name)
+  
+  if(!is.null(geneList)){
+    if(length(geneList)==1)
+      stop("Please specify more than 1 valid gene symbol")
+    
+    if(any(!geneList %in% names(TSSg))){
+      cat("One or more of the gene names supplied is not present in the TSS annotation specified: \n")
+      cat(geneList[!geneList %in% names(TSSg)], sep = ", ")
+      cat("\n")
+      stop()
+    }
+    
+    TSSg <- TSSg[geneList]
+  }
+  
+  # Checking in case some genes in RNA don't overlap our TSS annotations
+  genesToKeep <- intersect(names(TSSg),rownames(RNAmat))
+  cat("\nNum genes overlapping TSS annotation and RNA matrix being considered: ",length(genesToKeep),"\n")
+  
+  # Match gene order in RNA matrix and TSS ranges
+  RNAmat <- RNAmat[genesToKeep,]
+  TSSg <- TSSg[genesToKeep]
+  
+  # Pad TSS by this much *either side*
+  TSSflank <- GenomicRanges::flank(TSSg,
+                                   width = windowPadSize,
+                                   both = TRUE)
+  
+  # Get peak summit
+  cat("\nTaking peak summits from peak windows ..\n")
+  peakSummits <- resize(peakRanges,width = 1,fix = "center")
+  
+  # Find overlap of all peaks to all genes given window
+  # Subject is Peaks, query is Gene
+  cat("Finding overlapping peak-gene pairs ..\n")
+  genePeakOv <- findOverlaps(query = TSSflank,subject = peakSummits)
+  numPairs <- length(genePeakOv)
+  
+  cat("Found ",numPairs,"total gene-peak pairs for given TSS window ..\n")
+  
+  cat("Number of peak summits that overlap any gene TSS window: ",length(unique(subjectHits(genePeakOv))),"\n")
+  cat("Number of gene TSS windows that overlap any peak summit: ",length(unique(queryHits(genePeakOv))),"\n\n")
+  
+  # For each gene, determine observed correlation of each overlapping peak to its associated gene (gene expression)
+  
+  # For each of those genes, also determine correlation based on background peaks (run in parallel) and save
+  # Do this in parallel, and get data frame of gene-peak-pearson values
+  # Fetch background peaks for each peak tested (i.e. that has overlap in window with gene)
+  set.seed(123)
+  cat("Determining background peaks ..\n")
+  
+  if(is.null(rowData(ATAC.se)$bias)){
+    if(genome %in% "hg19")
+      myGenome <- BSgenome.Hsapiens.UCSC.hg19::BSgenome.Hsapiens.UCSC.hg19
+    if(genome %in% "mm10")
+      myGenome <- BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+    if(genome %in% "hg38")
+      myGenome <- BSgenome.Hsapiens.UCSC.hg38::BSgenome.Hsapiens.UCSC.hg38
+    
+    ATAC.se <- chromVAR::addGCBias(ATAC.se,genome=myGenome) }
+  
+  cat("Using ",n_bg," iterations ..\n\n")
+  
+  set.seed(123)
+  bg <- chromVAR::getBackgroundPeaks(ATAC.se,niterations=n_bg)
+  
+  cat("Computing gene-peak correlations ..\n")
+  
+  pairsPerChunk <- 200
+  
+  # This defines the outer (larger chunks)
+  largeChunkSize <- 1000
+  
+  startingPoint <- 1 # If for any reason the workers fail, resume from where it failed by specifying the starting point here
+  chunkStarts <- seq(startingPoint, numPairs, largeChunkSize)
+  chunkEnds <- chunkStarts + largeChunkSize -1
+  chunkEnds[length(chunkEnds)] <- numPairs
+  
+  library(doParallel)
+  
+  dorcList <- list()
+  for(i in 1:length(chunkStarts)){
+    cat("Running pairs: ",chunkStarts[i], "to",chunkEnds[i],"\n")
+    # This fill further chunk this up and run in parallel, saving the merged output ObsCor
+    ObsCor <- PeakGeneCor(ATAC = ATACmat,
+                          RNA = RNAmat,
+                          OV = genePeakOv[chunkStarts[i]:chunkEnds[i]],
+                          chunkSize = pairsPerChunk,
+                          ncores = nCores,
+                          bg = bg)
+    gc()
+    
+    dorcList[[i]] <- ObsCor
+  }
+  
+  cat("\nMerging results ..\n")
+  dorcTab <- bind_rows(dorcList)
+  
+  cat("Performing Z-test for correlation significance ..\n")
+  permCols <- 4:(ncol(bg)+3)
+  
+  
+  # Filter to positive correlations
+  cat("Only considering positive correlations ..\n")
+  dorcTabFilt <- dorcTab %>% dplyr::filter(rObs > 0)
+  
+  # Remove multi-mapping peaks (force 1-1 mapping)
+  cat("Keeping max correlation for multi-mapping peaks ..\n")
+  dorcTabFilt <- dorcTabFilt %>% group_by(Peak) %>% dplyr::filter(rObs==max(rObs))
+  
+  
+  # Swap gene number for gene symbol from TSS annotation lookup
+  dorcTabFilt$Gene <- as.character(TSSg$gene_name)[dorcTabFilt$Gene]
+  
+  # Swap peak numbers to match reference input peak numbers
+  # This only changes if some peaks had zero accessibility and were filtered out internally
+  # Use rownames from reference matching
+  dorcTabFilt$Peak <- as.numeric(splitAndFetch(rownames(ATACmat)[dorcTabFilt$Peak],"Peak",2))
+  
+  # # Z test pval
+  dorcTabFilt$rBgSD <- matrixStats::rowSds(as.matrix(dorcTabFilt[,permCols]))
+  dorcTabFilt$rBgMean <- rowMeans(dorcTabFilt[,permCols])
+  dorcTabFilt$pvalZ <- 1-stats::pnorm(q = dorcTabFilt$rObs,mean = dorcTabFilt$rBgMean,sd = dorcTabFilt$rBgSD)
+  
+  
+  cat("\nFinished!\n")
+  
+  if(!is.null(p.cut)){
+    cat("Using significance cut-off of ",p.cut," to subset to resulting associations\n")
+    dorcTabFilt <- dorcTabFilt[dorcTabFilt$pvalZ <= p.cut,] # Subset to significant correlations only
+  }
+  
+  return(as.data.frame(dorcTabFilt[,c("Peak","Gene","rObs","pvalZ")],stringsAsFactors=FALSE))
+}
+
+# Function to make J plot of significant peak-gene assocoations to call DORCs using
+dorcJplot <- function(dorcTab, # table returned from runGenePeakcorr function
+                      cutoff=7, 
+                      labelTop=25,
+                      returnGeneList=FALSE, # Returns genes passing numPeak filter
+                      cleanLabels=TRUE,
+                      labelSize=4,
+                      ... # Additional params passed to ggrepel
+                      ){
+  
+  stopifnot(all(c("Peak","Gene","pvalZ") %in% colnames(dorcTab)))
+  
+  # Count the number of significant peak associations for each gene (without pre-filtering genes)
+  numDorcs <- dorcTab  %>% group_by(Gene) %>% tally() %>% arrange(desc(n))
+  numDorcs$Index <- 1:nrow(numDorcs) # Add order index
+  numDorcs %>% as.data.frame(stringsAsFactors=FALSE) -> numDorcs
+  rownames(numDorcs) <- numDorcs$Gene
+  
+  dorcGenes <- numDorcs$Gene[numDorcs$n >= cutoff]
+  
+  numDorcs <- numDorcs %>%
+    mutate(isDORC=ifelse(Gene %in% dorcGenes,"Yes","No")) %>%
+    mutate(Label=ifelse(Gene %in% dorcGenes[1:labelTop],Gene,""))
+  
+  # Plot
+  dorcG <- ggplot(numDorcs,aes(x=Index,y=n,color=isDORC,label=Label)) +
+    geom_hline(linetype="dotted",yintercept = cutoff)+
+    geom_vline(linetype="dotted",xintercept = max(numDorcs[numDorcs$Gene %in% dorcGenes,"Index"]))+
+    geom_point(size=0.8) +
+    geom_line()+
+    scale_color_manual(values=c("gray65","firebrick"))+
+    scale_y_continuous(breaks = scales::pretty_breaks())+
+    theme_classic() +
+    labs(y="Number of correlated peaks",x="Ranked genes",title=paste0("# DORCs: ( n >= ",cutoff,") = ",length(dorcGenes)))+
+    theme(axis.text = element_text(color = "black"),legend.position = "none",plot.title=element_text(hjust=0.5)) +
+    scale_x_reverse() # flip so we can add labels later, if needed, with more space
+  
+  if(cleanLabels){
+    dorcG <- dorcG + ggrepel::geom_label_repel(size=labelSize,max.iter = 100,max.overlaps = Inf,fontface="italic",...)
+  } else {
+    dorcG <- dorcG + ggplot2::geom_text(size=labelSize,fontface="italic",...)
+  }
+  
+  print(dorcG)
+  
+  if(returnGeneList)
+    return(dorcGenes)
+  
+  
+}
+
+# Function to calculate single cell DORC scores using scATAC-seq data and pre-determined peak-gene associations
+getDORCScores <- function(ATAC.se, # SummarizedExperiment of scATAC-seq data (exact same used as input to runGenePeakcorr function)
+                          dorcTab, # List of FILTERED peak-gene associations (e.g. after filtering for pvalZ <= 0.05 in the returned data.frame from runGenePeakcorr)
+                          normalizeATACmat=TRUE,
+                          geneList=NULL, # Here, you can provide your list of DORC genes, since you don't want to compute scores for all genes (which includes genes with too few peaks associated)
+                          nCores=4 # How many cores to use, if parallel support
+			  ){
+
+
+  if(!all(c("Peak","Gene") %in% colnames(dorcTab)))
+    stop("The provided gene-peak table must have columns named Peak and Gene ..")
+
+  if(any(dorcTab$Peak > nrow(ATAC.se)))
+    stop("One or more peak indices in the gene-peak table are larger than the total number of peaks in the provided ATAC SE object ..\n Make sure the exact same SummarizedExperiment object is provided here as was for running the runGenePeakcorr function ..\n")
+
+  if(!is.null(geneList)){
+    if(!(all(geneList %in% as.character(dorcTab$Gene))))
+      stop("One or more of the gene names supplied is not present in the gene-peak table provided..\n")
+
+    if(length(geneList) > 50){
+	    message("Running DORC scoring for ",length(geneList)," genes: ",paste(geneList[1:20],collapse=", "),", ... , ... , ... (truncated display)")
+    } else {
+      message("Running DORC scoring for ",length(geneList)," genes: ",paste(geneList,collapse = "\n"))
+    }
+
+    cat("........\n")
+
+    dorcTab <- dorcTab[dorcTab$Gene %in% geneList,] # Filter only to these genes
+    dorcGenes <- sort(as.character(unique(dorcTab$Gene)))
+  } else {
+    dorcGenes <- sort(as.character(unique(dorcTab$Gene)))
+    cat("Running DORC scoring for all genes in annotation! (n = ",length(dorcGenes),")\n",sep="")
+  }
+
+
+  if(normalizeATACmat){
+    # Normalize
+    cat("Normalizing scATAC counts ..\n")
+    ATAC.mat <- assay(centerCounts(ATAC.se,chunkSize = 5000))
+    gc()
+  } else {
+    cat("Assuming provided scATAC counts are normalized ..\n")
+    ATAC.mat <- assay(ATAC.se)
+  }
+
+  time_elapsed <- Sys.time()
+
+  cat("Computing DORC scores ..\n")
+  cat("Running in parallel using ", nCores, "cores ..\n")
+
+  dorcMatL <- pbmcapply::pbmclapply(X=dorcGenes,
+                                    FUN=function(x) {
+
+                                      dorcPeaks <- unique(dorcTab$Peak[dorcTab$Gene %in% x])
+
+                                      if(length(dorcPeaks) > 1) {
+                                        dorcCounts <- Matrix::colSums(ATAC.mat[dorcPeaks,])
+                                      } else if(length(dorcPeaks==1)) {
+                                        dorcCounts <- ATAC.mat[dorcPeaks,]
+                                      }
+                                    },mc.cores = nCores)
+
+  dorcMat <- as.sparse(do.call('rbind',dorcMatL))
+
+  rownames(dorcMat) <- dorcGenes
+
+  time_elapsed <- Sys.time() - time_elapsed
+  cat(paste("\nTime Elapsed: ",time_elapsed, units(time_elapsed)),"\n\n")
+
+  return(dorcMat)
+
+}
+```
+
+```{r FIGr functions}
+# Script housing main FigR wrapper functions
+
+### Author: Vinay Kartha
+### Contact: <vinay_kartha@g.harvard.edu>
+### Affiliation: Buenrostro Lab, Department of Stem Cell and Regenerative Biology, Harvard University
+
+library(ggplot2)
+library(ggrepel)
+library(reshape2)
+library(ggrastr)
+library(BuenColors)
+library(ComplexHeatmap)
+library(circlize)
+library(networkD3)
+library(GGally)
+library(igraph)
+library(network)
+library(Rmpfr)
+
+# setwd("<data_analysis_folder>")
+# source("./code/utils.R")
+
+# ---------------------------------------------------------------------------------- FUNCTION DEFINITIONS
+
+runFigR <- function(ATAC.se, # SE of scATAC peak counts. Needed for chromVAR bg peaks etc.
+                    dorcK=30, # How many dorc kNNs are we using to pool peaks
+                    dorcTab, # peak x DORC connections (should contain indices relative to peaks in ATAC.se)
+                    n_bg=50, # No. of background peaks to use for motif Z test
+                    genome, # One of mm10, hg19, hg38, with no default
+                    dorcMat, # Expect smoothed
+                    rnaMat, # Expect smoothed
+                    dorcGenes=NULL, # If only running on a subset of genes
+                    nCores=1
+){
+  # Must be matched data
+  stopifnot(all.equal(ncol(dorcMat),ncol(rnaMat)))
+  
+  # Expects "Gene" / "Peak" in dorcTab
+  if(!all(c("Peak","Gene") %in% colnames(dorcTab)))
+    stop("Expecting fields Peak and Gene in dorcTab data.frame .. see runGenePeakcorr function in BuenRTools")
+  
+  if(all(grepl("chr",dorcTab$Peak,ignore.case = TRUE))) {
+    usePeakNames <- TRUE
+    message("Detected peak region names in Peak field")
+    
+    if(!(all(grepl("chr",rownames(ATAC.se),ignore.case = TRUE))))
+      stop("Peak regions provided in dorcTab data.frame but not found as rownames in input SE")
+      
+    if(!all(dorcTab$Peak %in% rownames(ATAC.se)))
+      stop("Found DORC peak region not present in input SE.. make sure DORC calling output corresponds to same input SE as the one provided here ..")
+  } else{
+    usePeakNames <- FALSE
+    message("Assuming peak indices in Peak field")
+  # If using index, make sure no indices are outside range of SE
+    if(max(dorcTab$Peak) > nrow(ATAC.se))
+      stop("Found DORC peak index outside range of input SE.. make sure DORC calling output corresponds to same input SE as the one provided here ..")
+  }  
+  
+  
+  if(is.null(dorcGenes)) {
+    dorcGenes <- rownames(dorcMat)
+  } else {
+    cat("Using specified list of dorc genes ..\n")
+    if (!(all(dorcGenes %in% rownames(dorcMat)))) {
+      cat("One or more of the gene names supplied is not present in the DORC matrix provided: \n")
+      cat(dorcGenes[!dorcGenes %in% rownames(dorcMat)], sep = ", ")
+      cat("\n")
+      stop()
+    }
+  }
+  
+  DORC.knn <- FNN::get.knn(data = t(scale(Matrix::t(dorcMat))),k = dorcK)$nn.index # Scaled
+  rownames(DORC.knn) <- rownames(dorcMat)
+  
+  if (is.null(rowData(ATAC.se)$bias)) {
+    if (genome %in% "hg19") 
+      myGenome <- BSgenome.Hsapiens.UCSC.hg19::BSgenome.Hsapiens.UCSC.hg19
+    if (genome %in% "mm10") 
+      myGenome <- BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+    if (genome %in% "hg38") 
+      myGenome <- BSgenome.Hsapiens.UCSC.hg38::BSgenome.Hsapiens.UCSC.hg38
+    ATAC.se <- chromVAR::addGCBias(ATAC.se, genome = myGenome)
+  }
+  
+  if(grepl("hg",genome)){
+    pwm <- chromVARmotifs::human_pwms_v2
+    # pwm <- readRDS("./data/cisBP_human_pfms_2021.rds")
+  } else {
+    # pwm <- BuenRTools::mouse_pwms_v3
+    pwm <- readRDS("~/cisBP_mouse_pfms_2021.rds")
+  }
+  
+  # Old motif naming convention
+  if(all(grepl("_",names(pwm),fixed = TRUE)))
+     names(pwm) <- extractTFNames(names(pwm))
+  
+  message("Removing genes with 0 expression across cells ..\n")
+  rnaMat <- rnaMat[Matrix::rowSums(rnaMat)!=0,]
+  myGeneNames <- gsub(x = rownames(rnaMat),pattern = "-",replacement = "") # NKX2-1 to NKX21 (e.g.)
+  rownames(rnaMat) <- myGeneNames
+  
+  # Only non-zero expression TFs (also found in rnaMat)
+  motifsToKeep <- intersect(names(pwm),myGeneNames)
+    
+  # This has to be done on the full SE (same peakset used as input to dorc calling)
+  cat("Getting peak x motif matches ..\n")
+  motif_ix <- motifmatchr::matchMotifs(subject = ATAC.se,pwms = pwm[motifsToKeep],genome=genome)
+  
+  # Keep TFs with some peak x motif match
+  motif_ix <- motif_ix[,Matrix::colSums(assay(motif_ix))!=0] 
+  
+  cat("Determining background peaks ..\n")
+  cat("Using ", n_bg, " iterations ..\n\n")
+  if(any(Matrix::rowSums(assay(ATAC.se))==0)){
+    ATAC.mat <- assay(ATAC.se)
+    ATAC.mat <- cbind(ATAC.mat,1)
+    ATAC.se.new <- SummarizedExperiment::SummarizedExperiment(assays = list(counts=ATAC.mat),rowRanges = granges(ATAC.se))
+    set.seed(123)
+    bg <- chromVAR::getBackgroundPeaks(ATAC.se.new, niterations = n_bg)
+  } else {
+    set.seed(123)
+    bg <- chromVAR::getBackgroundPeaks(ATAC.se, niterations = n_bg)
+  }
+  
+  # For each DORC, do motif enrichment among dorc sig Peaks, and correlation of DORC accessibility (smoothed) to TF RNA levels
+  
+  cat("Testing ",length(motifsToKeep)," TFs\n")
+  cat("Testing ",nrow(dorcMat)," DORCs\n")
+  library(doParallel)
+  if(nCores > 1)
+    message("Running FigR using ",nCores," cores ..\n")
+  opts <- list()
+  pb <- txtProgressBar(min = 0, max = length(dorcGenes), style = 3)
+  progress <- function(n) setTxtProgressBar(pb, n)
+  opts <- list(progress = progress)
+  time_elapsed <- Sys.time()
+  cl <- parallel::makeCluster(nCores)
+  doSNOW::registerDoSNOW(cl)
+  mZtest.list <- foreach(g=dorcGenes,
+                         .options.snow = opts, 
+                         .packages = c("dplyr","Matrix", "SummarizedExperiment")) %dopar%   {
+                           # Take peaks associated with gene and its k neighbors
+                           # Pool and use union for motif enrichment
+                           DORCNNpeaks <- unique(dorcTab$Peak[dorcTab$Gene %in% c(g,dorcGenes[DORC.knn[g,]])])
+                           
+                           extractTFNames <- function(motifIDs){
+                             if(all(grepl("_",motifIDs,fixed = TRUE))){
+                               sapply(strsplit(sapply(strsplit(motifIDs,"_LINE.",fixed=FALSE),"[[",2),"_",fixed=FALSE),"[[",2)
+                             } else {
+                               message("One or more provided motif IDs do not contain any '_' characters .. returning IDs as is")
+                               motifIDs
+                             }
+                           }
+
+                           
+                           motifPeakZtest <- function(peakSet, ### peak_set: vector of peak ids you wish to test for motif enrichment
+                                                      bgPeaks, ### bg_peaks: matrix of background peak selection iterations by    
+                                                      tfMat ### tf: binary matrix of peak by motif
+                           ) {
+                             
+                             if(nrow(tfMat)!=nrow(bgPeaks))
+                               stop("Reference peak set used for TF and background peaks matrix must match..\n")
+                             
+                             if(!all(peakSet %in% 1:nrow(bgPeaks)))
+                               stop("One or more of the provided peak indices are out of the background peak set range ..\n")
+                             
+                             
+                             # get selected peak motif frequencies
+                             cat("Getting selected peak motif frequencies ..\n")
+                             
+                             # get frequency of motifs in test set (observed)
+                             p.tab <- Matrix::colMeans(tfMat[peakSet, ])
+                             
+                             # get the background frequency in peak sets of the same size
+                             cat("Getting background peak motif frequencies ..\n")
+                             # extract relevant rows (i.e. peakset being tested) from background peak matrix
+                             bg.f <- as.matrix(bgPeaks[peakSet, ])
+                             
+                             # calculate (background) motif frequencies in each iteration of background peaks corresponding to 
+                             bg.tab <- apply(bg.f[, c(1:ncol(bgPeaks))], 2, function(bg_iter) {
+                               
+                               b.i <- Matrix::colMeans(tfMat[bg_iter, ])
+                               return(b.i)
+                               
+                             })
+                             
+                             cat("Calculating empirical p values and z score p values ..\n")
+                             
+                             # loop over each motif and generate enrichment statistics compared to background
+                             m.p <- dplyr::bind_rows(lapply(names(p.tab), function(motif) {
+                               
+                               # calculate sd and mean frequencies for bg and selected peaks
+                               s <- sd(bg.tab[motif, ])
+                               bg_freq <- mean(bg.tab[motif, ])
+                               
+                               z_score <- (p.tab[motif] - bg_freq) / s
+                               
+                               # generate data.frame object of relevant statistics
+                               d <- data.frame(
+                                 motifID = motif,
+                                 gene = extractTFNames(motif),
+                                 motif_obs_freq = p.tab[motif],
+                                 motif_bg_freq = mean(bg.tab[motif, ]),
+                                 motif_counts = p.tab[motif] * length(peakSet),
+                                 emp_pval = 1 - (sum(bg.tab[motif, ] < p.tab[motif]) / ncol(bg.tab)),
+                                 z_test = z_score,
+                                 pval.z = 2 * pnorm(-abs(z_score)),
+                                 signed.log10p = -log10(2 * pnorm(-abs(z_score))) * sign(z_score)
+                               )
+                               return(d)
+                             }))
+                             # sort by enrichment pval, motif observed frequency
+                             m.p <- dplyr::arrange(m.p,pval.z, motif_obs_freq)
+                             # return df of enrichment scores
+                             return(m.p)
+                           }
+                           
+                           if(usePeakNames)
+                             DORCNNpeaks <- which(rownames(ATAC.se) %in% DORCNNpeaks) # Convert to index relative to input
+                             
+                           mZ <- motifPeakZtest(peakSet = DORCNNpeaks,
+                                                bgPeaks = bg,
+                                                tfMat = assay(motif_ix))
+                           mZ <- mZ[,c("gene","z_test")]
+                           colnames(mZ)[1] <- "Motif"
+                           colnames(mZ)[2] <- "Enrichment.Z"
+                           mZ$Enrichment.P <- 2*pnorm(abs(mZ$Enrichment.Z),lower.tail = FALSE) # One-tailed
+                           mZ$Enrichment.log10P <- sign(mZ$Enrichment.Z) * -log10(mZ$Enrichment.P)
+                           mZ <- cbind("DORC"=g,mZ)
+                           # Correlate smoothed dorc with smoothed expression, with spearman
+                           corr.r <- cor(dorcMat[g,],t(as.matrix(rnaMat[mZ$Motif,])),method = "spearman")
+                           stopifnot(all.equal(colnames(corr.r),mZ$Motif))
+                           mZ$Corr <- corr.r[1,] # Correlation coefficient
+                           mZ$Corr.Z <- scale(mZ$Corr,center = TRUE,scale = TRUE)[,1] # Z-score among all TF correlations
+                           mZ$Corr.P <- 2*pnorm(abs(mZ$Corr.Z),lower.tail = FALSE) # One-tailed
+                           mZ$Corr.log10P <- sign(mZ$Corr.Z)*-log10(mZ$Corr.P)
+                           return(mZ)
+                         }
+  cat("Finished!\n")
+  cat("Merging results ..\n")
+  # Merge and save table for downstream filtering and plotting (network)
+  TFenrich.d <- do.call('rbind',mZtest.list)
+  dim(TFenrich.d)
+  rownames(TFenrich.d) <- NULL
+  
+  # Make combined score based on multiplication
+  # Here, we only sign by corr
+  # Since sometimes we lose digit precision (1 - v small number is 1, instead of 0.9999999..)
+  # Use Rmpfr, increase precision limits above default (100 here)
+  TFenrich.d <- TFenrich.d %>% mutate("Score"=sign(Corr)*as.numeric(-log10(1-(1-Rmpfr::mpfr(Enrichment.P,100))*(1-Rmpfr::mpfr(Corr.P,100)))))
+  TFenrich.d$Score[TFenrich.d$Enrichment.Z < 0] <- 0
+  TFenrich.d
+}
+
+
+# Bar plot of ranked activator / repressors
+rankDrivers <- function(figR.d,
+                        myLabels=NULL){
+  
+    figR.summ <- figR.d %>%  group_by(Motif) %>% 
+      summarise(Score=mean(Score)) %>% 
+      arrange(Score) %>% 
+      dplyr::mutate(Motif=factor(Motif,levels=as.character(Motif)))
+    
+    # Top and bottom %ile labels
+    figR.summ$Label <- as.character(figR.summ$Motif)
+    
+    if(is.null(myLabels)){
+      # Use quantiles to define what labels are drawn
+      figR.summ$Label[figR.summ$Score >= quantile(figR.summ$Score,0.05) & figR.summ$Score <= quantile(figR.summ$Score,0.95)] <- ""
+    } else {
+      # Only highlight user-specified
+      figR.summ$Label[!figR.summ$Label %in% myLabels] <- ""
+    }
+      
+    
+    gAll <- ggplot(figR.summ,aes(x=Motif,y=Score,label=Label)) + 
+      geom_bar(size=0.1,stat="identity",fill="darkorange",color=NA) + 
+      theme_classic() + theme(axis.text.x = element_text(size = 10), axis.text = element_text(size = 10), axis.title = element_text(size = 20)) + 
+      geom_hline(yintercept = 0) + labs(x="TF Motifs",y="Regulation Score")+coord_flip()
+    
+    gAll
+}
+
+geom_text_repel(size=4,min.segment.length = 0.2, hjust = 0.5) + 
+
+
+# Scatter
+plotDrivers <- function(figR.d,
+                        marker,
+                        score.cut=1,
+                        label=TRUE){
+
+  if(!marker %in% figR.d$DORC)
+    stop("Marker specified is not a valid DORC symbol found in the data.frame")
+
+  d <- figR.d %>% dplyr::filter(DORC %in% marker) %>% mutate(isSig=ifelse(abs(Score) >= score.cut,"Yes","No"))
+  d$Label <- d$Motif
+  d$Label[d$isSig %in% "No"] <- ""
+  gScatter <- d %>%  ggplot(aes(x=Corr.log10P,y=Enrichment.log10P,color=isSig,label=Label)) + 
+    geom_hline(yintercept = 0,color="gray60",linetype="dashed") + 
+    geom_vline(xintercept = 0,color="gray60",linetype="dashed") + 
+    geom_point(size=1.5,shape=16) + theme_classic() + 
+    scale_color_manual(values=c("gray66","firebrick3"))+
+    scale_x_continuous(breaks=scales::pretty_breaks()) +
+    scale_y_continuous(breaks=scales::pretty_breaks()) + 
+    labs(y="Enrichment log10 P",x="Correlation log10 P",title=marker) + 
+    ylim(-ceiling(max(abs(d$Enrichment.log10P))), ceiling(max(abs(d$Enrichment.log10P))))+
+    xlim(-ceiling(max(abs(d$Corr.log10P))), ceiling(max(abs(d$Corr.log10P))))+
+    theme(legend.position = "none",axis.text = element_text(color="black", size = 5),
+          plot.title = element_text(hjust=0.1,face="italic", size = 6),panel.background = element_rect(fill=NA), axis.title = element_text(size = 0)) + 
+    geom_text_repel(hjust=0.5,fontface="italic",color="black",size=7, force = 1)
+  
+  gScatter
+  
+}
+figR.d <-stim_FigR 
+plotfigRHeatmap <- function(figR.d,
+                            score.cut=1,
+                            DORCs=NULL,
+                            TFs=NULL,
+                            ... # Additional params passed to ComplexHeatmap
+){
+  
+  
+  DORCsToKeep <- figR.d %>% dplyr::filter(abs(Score) >= score.cut) %>% pull(DORC) %>% unique()
+  TFsToKeep <- figR.d %>% dplyr::filter(abs(Score) >= score.cut) %>% pull(Motif) %>% unique()
+  
+  
+  if(!is.null(DORCs)){
+    if(!all(DORCs %in% figR.d$DORC))
+      stop("One or more DORCs specified is not a valid DORC symbol found in the data.frame")
+    DORCsToKeep <- intersect(DORCsToKeep,DORCs)
+    TFsToKeep <- figR.d %>% dplyr::filter(abs(Score) >= score.cut & DORC %in% DORCsToKeep) %>% pull(Motif) %>% unique()
+  }
+  
+  
+  if(!is.null(TFs)){
+    if(!all(TFs %in% figR.d$Motif))
+      stop("One or more TFs specified is not a valid TF symbol found in the data.frame")
+    TFsToKeep <- intersect(TFsToKeep,TFs)
+    DORCsToKeep <- figR.d %>% dplyr::filter(abs(Score) >= score.cut & Motif %in% TFsToKeep) %>% pull(DORC) %>% unique()
+  }
+ 
+  
+  net.d <- figR.d %>% dplyr::filter(DORC %in% DORCsToKeep & Motif %in% TFsToKeep) %>% 
+    reshape2::dcast(DORC ~ Motif) %>% 
+    tibble::column_to_rownames("DORC") %>% as.matrix()
+
+  message("Plotting ",nrow(net.d)," DORCs x ",ncol(net.d), "TFs\n")
+  
+  # Heatmap view
+  
+  myCols <- colorRamp2(seq(-2,2,length.out = 9),colors = c("#5E4FA2", "#3288BD" ,"#66C2A5", "#ABDDA4"  ,"gray95", "#FDAE61", "#F46D43", "#D53E4F" ,"#9E0142"))
+  myHeat <- Heatmap(net.d,
+          col=myCols,
+          clustering_distance_rows = "pearson",
+          clustering_distance_columns = "pearson",
+          name="Score",border = TRUE,
+          row_names_gp = gpar(fontsize=8,fontface="italic"),...)
+  
+  myHeat
+  
+}
+
+
+plotfigRNetwork <- function(figR.d,
+                        score.cut=1,
+                        DORCs=NULL,
+                        TFs=NULL,
+                        weight.edges=FALSE){
+# Network view
+
+# Filter
+net.dat <-  figR.d %>% dplyr::filter(abs(Score) >= score.cut)
+
+if(!is.null(DORCs))
+  net.dat <- net.dat %>% dplyr::filter(DORC %in% DORCs)
+
+if(!is.null(TFs))
+  net.dat <- net.dat %>% dplyr::filter(Motif %in% TFs)
+
+net.dat$Motif <- paste0(net.dat$Motif, ".")
+net.dat$DORC <- paste0(net.dat$DORC)
+
+
+dorcs <- data.frame(name = unique(net.dat$DORC), group = "DORC", size = 8)
+tfs <- data.frame(name = unique(net.dat$Motif), group = "TF", size = 3)
+nodes <- rbind(dorcs,tfs)
+
+edges <- as.data.frame(net.dat)
+
+# Make edges into links (subtract 1 for 0 indexing)
+links <- data.frame(source=unlist(lapply(edges$Motif, function(x) {which(nodes$name==x)-1})), 
+                    target=unlist(lapply(edges$DORC, function(x) {which(nodes$name==x)-1})), 
+                    corr=edges$Corr,
+                    enrichment=edges$Enrichment.P)
+
+links$Value <- scales::rescale(edges$Score)*20
+
+# Set of colors you can choose from for TF/DORC nodes
+colors <- c("Red", "Orange", "Yellow", "Green", "Blue", "Purple", "Tomato", "Forest Green", "Sky Blue","Gray","Steelblue3","Firebrick2","Brown")
+nodeColorMap <- data.frame(color = colors, hex = gplots::col2hex(colors))
+
+getColors <- function(tfColor, dorcColor = NULL) {
+  temp <- c(as.character(nodeColorMap[nodeColorMap$color==tfColor,]$hex),
+            as.character(nodeColorMap[nodeColorMap$color==dorcColor,]$hex))
+  if (is.null(dorcColor)) {
+    temp <- temp[1]
+  }
+  colors <- paste(temp, collapse = '", "')
+  colorJS <- paste('d3.scaleOrdinal(["', colors, '"])')
+  colorJS
+}
+
+forceNetwork(Links = links, 
+             Nodes = nodes,
+             Source = "target",
+             Target = "source",
+             NodeID = "name",
+             #NodeID="myLabel",
+             Group = "group",
+             Value = "Value",
+             Nodesize = "size",
+             #linkWidth = 1.5, # Fixed link weight
+             radiusCalculation = "Math.sqrt(d.nodesize)*2",
+             arrows = FALSE,
+             opacityNoHover = 0.6,
+             opacity = 1,
+             zoom = TRUE,
+             bounded = TRUE,
+             charge = -15, 
+             fontSize = 13,
+             legend = TRUE,
+             colourScale = getColors(tfColor = "Tomato",dorcColor =  "Sky Blue"), # TF then DORC
+             linkColour = ifelse(links$corr > 0, as.character(nodeColorMap[nodeColorMap$color=="Forest Green",]$hex),
+                                 as.character(nodeColorMap[nodeColorMap$color=="Purple",]$hex)))
+
+}
+
+```
+
+```{rNN time}
+# Script to determine stimulation NN time
+
+### Author: Vinay Kartha
+### Contact: <vinay_kartha@g.harvard.edu>
+### Affiliation: Buenrostro Lab, Department of Stem Cell and Regenerative Biology, Harvard University
+
+
+library(dplyr)
+library(chromVAR)
+library(BuenColors)
+library(ggplot2)
+
+
+# Function to make dotPlot of nn stim time estimates, using Control 1h, and the stim 1h 6h and GI conditions
+nnDotPlot <- function(df, # Pseudotime data frame (melted). Must have columns "Condition", "cellType", "variable", and "value"
+                      stimType="IFN",
+                      cellType=NULL){
+  
+  stopifnot(stimType %in% df$variable)
+  #For this stim
+  myConditions <- c("Control_1h",paste0(stimType,c("_1h","_6h","GolgiPlug_6h")))
+  cat("Keeping conditions: ",myConditions,"\n")
+  stopifnot(all(myConditions %in% df$Condition))
+  
+  if(is.null(cellType)){
+    myCellType <- unique(df$cellType)
+  } else {
+    # Filter for cellType
+    stopifnot(all(cellType %in% unique(df$cellType)))
+    myCellType <- cellType
+  }
+  # Customize x-axis labels (grouping)
+  myLabels <- c("1h","1h","6h","GI")
+  names(myLabels) <- myConditions
+  
+  # Edited below line of code to plot scaled values instead of raw nn stim time estimates
+  df %>% dplyr::filter(Condition %in% myConditions & variable==paste0(stimType,".scaled") & cellType %in% myCellType) %>%
+    ggplot( aes(x=factor(Condition),y=value,color=Condition)) + 
+    geom_quasirandom(groupOnX = TRUE,size=0.8,shape=16) +
+    # Add median value
+    stat_summary(fun = "median", size= 0.3, geom = "crossbar",color="black",width=0.5)+
+    #geom_boxplot(outlier.size = 0.1,outlier.color = NA,width=0.5,color="black",fill=NA,alpha=0.5)+
+    theme_classic() + scale_y_continuous(expand=c(0,0)) +
+    labs(y="Stim response time",x="Condition") + 
+    scale_color_manual(values = myCols) + 
+    facet_grid(~cellType) + 
+    scale_x_discrete(labels=myLabels)+
+    theme(legend.position = "none",
+          #axis.text.x = element_text(angle=60,vjust=1,hjust = 1),
+          axis.text = element_text(color="black"),
+          strip.background = element_blank(),strip.text = element_text(size=11))
+  
+}
+
+
+# Function to compute NN stim time using either ATAC/RNA dorcs
+computeNNtime <- function(meta,# ATAC or RNA meta data (must have valid Condition column)
+                          mat, # LSI matrix or smoothed normed DORC score matrix
+                          isDORC=FALSE, # Is the above mat a DORC matrix? Assumes No (i.e. it is LSI/PCA).
+                          K=50 # K to use to find NN stim time based on nearest neighbor labels
+){
+  
+  # Do knn of unntreated cells to control+stim cells (leaving out Golgi here)
+  untreatedCells <- meta$Condition %in% "Untreated"
+  cellsToKeep <- !untreatedCells & !grepl("Golgi",meta$Condition)  # Includes controls, excludes golgis, untreated
+  cat("Cells being considered for NN mapping\n")
+  print(table(meta$Condition,cellsToKeep))
+  
+  # Conditions of all stim cells (minus Golgi and Untreated)
+  stimConditions <- factor(meta$Condition[cellsToKeep])
+  levels(stimConditions)
+  
+  # Give 0 weight to control cells, and 1 and 6 units to 1hr and 6hr cells in each stim, respectively
+  stimWeights <- c("Control_1h"=0,"Control_6h"=0,
+                   "IFN_1h"=1,"IFN_6h"=2, # We tried both 2/6 hr weight here
+                   "LPS_1h"=1,"LPS_6h"=2, # We tried both 2/6 hr weight here
+                   "PMA_1h"=1,"PMA_6h"=2) # We tried both 2/6 hr weight here
+  
+  stopifnot(all(names(stimWeights) %in% levels(stimConditions)))
+  
+  # Map knns for each query cell to each control/stim based on chromatin
+  
+  # If using sig smoothed DORC PC scores
+  # PCA on DORC scores Takes a long time to run if not cached already
+  # Should be cached already
+  if(isDORC){
+    cat("Determining PCA on DORC scores ..\n")
+    pc.DORC <- cachePCA(dataSet=t(scale(mat)),
+                        scale=FALSE,
+                        center=FALSE,
+                        cachePath = "./PCAcache/")
+    
+    
+    DORCpcScores <- pc.DORC$x[,1:20]
+    
+    cat("PC score dimensions\n")
+    print(dim(DORCpcScores))
+    
+    cat("Getting ",K," nearest neighbors for NN stim time ..\n")
+    # All stim cells to all stim cells (minus golgi) map based on DORC PCs
+    knn <- FNN::get.knnx(query = DORCpcScores,
+                         data = DORCpcScores[cellsToKeep,],k = K)$nn.index  # Excludes  golgis and untreated from neighbor mapping (in ref)
+  } else {
+    
+    cat("Getting ",K," nearest neighbors for NN stim time ..\n")
+    # All stim cells to all stim cells (minus golgi) map based on LSI PCs
+    knn <- FNN::get.knnx(query = mat,
+                         data = mat[cellsToKeep,],k = K)$nn.index  # Excludes  golgis and untreated from neighbor mapping (in ref)
+  }
+  
+  dim(knn)
+  
+  # For each cell, compute the mean stim response pseudotime based on the matched control/stim cells
+  # Do this for each stim treatment condition
+  
+  pseudoTimelist <- list()
+  for(i in 1:nrow(knn)){
+    pseudoTimelist[[i]] <- table(stimConditions[knn[i,]]) * stimWeights/ncol(knn)
+    
+  }
+  
+  pseudoTime <- do.call('rbind',pseudoTimelist)
+  colnames(pseudoTime)
+  
+  # Weighted sum of 1hr and 6hr for each stim condition
+  # Each will be vector of size ncol(ATAC)
+  IFN.pseudo <- rowSums(pseudoTime[,c("IFN_1h","IFN_6h")])
+  LPS.pseudo <- rowSums(pseudoTime[,c("LPS_1h","LPS_6h")])
+  PMA.pseudo <- rowSums(pseudoTime[,c("PMA_1h","PMA_6h")])
+  
+  pseudo.d <- data.frame("IFN"=IFN.pseudo,
+                         "LPS"=LPS.pseudo,
+                         "PMA"=PMA.pseudo,
+                         Condition = as.character(meta$Condition), # This lets you filter cells by Condition
+                         stringsAsFactors = FALSE)
+  
+  rownames(pseudo.d) <- rownames(meta)
+  
+  return(pseudo.d)
+}
+
+
+setwd("<data_analysis_folder>")
+
+source("./code/misc_helper_stim.R")
+
+# ATAC based NN time
+
+# Load ATAC SE (paired)
+# NOTE that we load the paired dataset here
+ATAC.SE <- readRDS("./data/SE/ATAC_stim_paired.rds")
+ATAC.meta <- as.data.frame(colData(ATAC.SE),stringsAsFactors=FALSE)
+
+
+# V2 below is for weights 0-2; 
+pseudoFileATAC <- "./data/nnTime/LSI_NN_stim_pseudotimev2.tsv"
+
+if(file.exists(pseudoFileATAC)){
+  pseudo.d <- read.table(pseudoFileATAC,sep="\t",header=TRUE,stringsAsFactors = FALSE) 
+} else {
+
+  # Load LSI on full ATAC data (not just paired)
+  lsi <- read.table("./data/ArchR/scATAC_stim_LSI.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE,row.names = 1)
+  head(lsi)
+  
+  stopifnot(all(rownames(ATAC.meta) %in% rownames(lsi)))
+  
+  # Subset to paired ATAC
+  lsi <- lsi[colnames(ATAC.SE),]
+  
+  pseudo.d <- computeNNtime(meta = ATAC.meta,mat = lsi,K = 50) # Computed across all cells using condition labels
+  
+  # Re-scaled to 0-1
+  pseudo.d$IFN.scaled <- scales::rescale(pseudo.d$IFN,to=c(0,1))
+  pseudo.d$LPS.scaled <- scales::rescale(pseudo.d$LPS,to=c(0,1))
+  pseudo.d$PMA.scaled <- scales::rescale(pseudo.d$PMA,to=c(0,1))
+
+  stopifnot(identical(rownames(ATAC.meta),rownames(pseudo.d)))
+  
+  pseudo.d$cellType <- ATAC.meta$pairedLabel2
+  write.table(pseudo.d,pseudoFileATAC,sep="\t",quote=FALSE)
+}
+
+stopifnot(identical(rownames(ATAC.meta),rownames(pseudo.d)))
+
+
+# UMAP of NN stim time for each stim (Fig 4 in paper)
+library(ggplot2)
+library(BuenColors)
+
+IFN_UMAP_time <- plotMarker2D(ATAC.meta[,c("UMAP1","UMAP2")],markerMat = t(pseudo.d[,paste0(c("IFN","LPS","PMA"),".scaled")]),markers = "IFN.scaled",labels = "IFN_NN_time",pointSize = 0.1,colorPalette = "brewer_heat",rasteRize = TRUE) + scale_color_gradientn(breaks=scales::pretty_breaks(n=1),colours = jdb_palette("brewer_heat"))
+LPS_UMAP_time <- plotMarker2D(ATAC.meta[,c("UMAP1","UMAP2")],markerMat = t(pseudo.d[,paste0(c("IFN","LPS","PMA"),".scaled")]),markers = "LPS.scaled",labels = "LPS_NN_time",plotTitle = "LPS NN time",pointSize = 0.1,colorPalette = "brewer_blue",rasteRize = TRUE) + scale_color_gradientn(breaks=scales::pretty_breaks(n=1),colours = jdb_palette("brewer_blue"))
+PMA_UMAP_time <- plotMarker2D(ATAC.meta[,c("UMAP1","UMAP2")],markerMat = t(pseudo.d[,paste0(c("IFN","LPS","PMA"),".scaled")]),markers = "PMA.scaled",labels = "PMA_NN_time",plotTitle = "PMA NN time",pointSize = 0.1,colorPalette = "brewer_green",rasteRize = TRUE) + scale_color_gradientn(breaks=scales::pretty_breaks(n=1),colours = jdb_palette("brewer_green"))
+
+cowplot::plot_grid(IFN_UMAP_time,LPS_UMAP_time,PMA_UMAP_time,nrow=1,align="hv")
+
+d.m <- reshape2::melt(pseudo.d)
+
+# Dot/Box plots
+library(ggbeeswarm)
+myCols <- readRDS("./data/annot/myColsCondition.rds")
+
+#IFN
+nnDotPlot(df = d.m,stimType = "IFN")
+# LPS
+nnDotPlot(df = d.m,stimType = "LPS")
+# PMA
+nnDotPlot(df = d.m,stimType = "PMA")
+
+# Same, but for only Mono (Fig 4 in paper)
+
+#IFN
+IFNMono <- ggcustom(nnDotPlot(df = d.m,stimType = "IFN",cellType = "Mono"),clean = FALSE,splitLeg = FALSE)
+# LPS
+LPSMono <- ggcustom(nnDotPlot(df = d.m,stimType = "LPS",cellType = "Mono"),clean = FALSE,splitLeg = FALSE)
+# PMA
+PMAMono <- ggcustom(nnDotPlot(df = d.m,stimType = "PMA",cellType = "Mono"),clean = FALSE,splitLeg = FALSE)
+
+cowplot::plot_grid(IFNMono,LPSMono,PMAMono,align="hv",nrow=1)
+
+
+# Make density plot by Donor to show no donor-specific effect (Supp fig)
+pseudo.d$Donor <- ATAC.meta$Donor
+IFN.donor <- pseudo.d %>% dplyr::filter(Condition %in% c("Control_1h","IFN_1h","IFN_6h","IFNGolgiPlug_6h") & cellType %in% "Mono") %>% ggplot(aes(x=IFN.scaled,color=Donor)) + geom_density() + facet_wrap(~Condition,nrow=1,scales = "free_y") + theme_classic() + scale_y_continuous(breaks = scales::pretty_breaks(n=2)) + theme(strip.background = element_rect(color=NA,fill=NA),legend.position = "none",strip.text = element_text(size=5)) + scale_color_manual(values=c("brown","skyblue","darkorange","darkorchid4"))
+LPS.donor <- pseudo.d %>% dplyr::filter(Condition %in% c("Control_1h","LPS_1h","LPS_6h","LPSGolgiPlug_6h")  & cellType %in% "Mono") %>% ggplot(aes(x=LPS.scaled,color=Donor)) + geom_density() + facet_wrap(~Condition,nrow=1,scales = "free_y") + theme_classic() + scale_y_continuous(breaks = scales::pretty_breaks(n=2)) + theme(strip.background = element_rect(color=NA,fill=NA),legend.position = "none",strip.text = element_text(size=5)) + scale_color_manual(values=c("brown","skyblue","darkorange","darkorchid4"))
+PMA.donor <- pseudo.d %>% dplyr::filter(Condition %in% c("Control_1h","PMA_1h","PMA_6h","PMAGolgiPlug_6h")  & cellType %in% "Mono") %>% ggplot(aes(x=PMA.scaled,color=Donor)) + geom_density() + facet_wrap(~Condition,nrow=1,scales = "free_y") + theme_classic() + scale_y_continuous(breaks = scales::pretty_breaks(n=2)) + theme(strip.background = element_rect(color=NA,fill=NA),legend.position = "none",strip.text = element_text(size=5)) + scale_color_manual(values=c("brown","skyblue","darkorange","darkorchid4"))
+gComb <- cowplot::plot_grid(ggcustom(IFN.donor,splitLeg = FALSE,clean=FALSE),ggcustom(LPS.donor,splitLeg = FALSE,clean=FALSE),ggcustom(PMA.donor,splitLeg = FALSE,clean=FALSE),nrow=3)
+
+gComb
+```
+
+```{rOpt match}
+# Script housing dependency and wrapper function to perform optmatching between scATAC and scRNA cells
+# Assumes CCA has been run on both assays (together) already (see Methods of associated manuscript for details)
+
+### Author: Vinay Kartha, Yan Hu
+### Contact: <vinay_kartha@g.harvard.edu>
+### Affiliation: Buenrostro Lab, Department of Stem Cell and Regenerative Biology, Harvard University
+
+#setwd("<data_analysis_folder>")
+
+
+library(optmatch)
+library(Matrix)
+library(FNN)
+library(dplyr)
+
+# Function to plot resulting pairs
+# Assumes condordant vectors for ATAC and RNA labels
+# Also requires a data frame of UMAP coordinates with ATAC RNA labels as rownames
+plotPairs <- function(ATAC,
+                      RNA,
+                      umap.df, # Assumes rownames are cell barcodes
+                      max.show=300,
+                      seed=123,
+                      pairPoiintSize=1
+                      ){
+
+  cat("Assuming concordance in pairs ..\n")
+
+  stopifnot(!is.null(rownames(umap.df)))
+  stopifnot(all.unique(rownames(umap.df)))
+  stopifnot(length(ATAC)==length(RNA))
+
+  if(length(ATAC) > max.show){
+    cat("Only highlighting",max.show,"pairs at random..\n")
+    set.seed(seed)
+    subsample <- sample(1:length(ATAC),max.show,replace = FALSE)
+    ATAC <- ATAC[subsample]
+    RNA <- RNA[subsample]
+  }
+
+  d1 <- umap.df[ATAC,1:2]
+  d2 <- umap.df[RNA,1:2]
+
+  d1$pair <- factor(1:nrow(d1))
+  d2$pair <- d1$pair
+
+  d1$Group <- "ATAC"
+  d2$Group <- "RNA"
+
+  d <- rbind(d1,d2)
+
+
+  require(ggrastr)
+  ggplot(umap.df, aes(x = UMAP1, y = UMAP2)) +
+    geom_point_rast(color="gray95",size=1.5)+
+    geom_point(data=d,aes(UMAP1,UMAP2,color=Group),alpha=0.8,size=pairPoiintSize) +
+    scale_color_manual(values=c("cadetblue","darkorange"))+
+    geom_line(data = d, aes(x = UMAP1, y = UMAP2, group = pair),alpha=0.4,color="darkgray")+
+    theme_void()+
+    labs(color="")+
+    theme(legend.position = "bottom")+
+    guides(colour = guide_legend(override.aes = list(size=3)))
+}
+
+
+# Function that gives you an "up-sampled" dataset given two paired datasets
+# Draws cells using density-based upsampling from smaller one till it matches larger one
+
+smartUpSample <- function(mat1,
+                          mat2,
+                          seed=123,
+                          dist.use="pearson"){
+  if(nrow(mat1) >= nrow(mat2)){
+    bigger <- mat1
+    smaller <- mat2 } else {
+      bigger <- mat2
+      smaller <- mat1
+    }
+
+  big.cells <- rownames(bigger)
+  small.cells <- rownames(smaller)
+
+  if(is.null(big.cells) | is.null(small.cells))
+    stop("Both ATAC and RNA CCA matrices must have rownames (cell IDs) ..\n")
+
+  # Perform Greedy pairing for these cells based on pearson correlation (max)
+  cat("Performing initial greedy pairing using ",dist.use, "as metric ..\n")
+  # Rows are bigger matrix cells, cols are smaller matrix cells
+  cca.cor <- cor(t(bigger),t(smaller),method = dist.use)
+  cor.max <- apply(cca.cor,1,function(x) names(which.max(x)))
+
+  stopifnot(all.equal(rownames(cca.cor),names(cor.max)))
+
+  pairing.greedy <- data.frame("bigger"=names(cor.max),"smaller"=as.character(cor.max),stringsAsFactors = FALSE)
+
+  rm(cca.cor)
+  gc()
+
+  # E.g. For each RNA cell, see how many ATAC cells it paired to
+  numBiggerpairs <- c()
+  for(i in small.cells){
+    numBiggerpairs <- c(numBiggerpairs,sum(pairing.greedy$smaller %in% i))
+  }
+
+
+  # Smooth the above number based on RNA CCA knn
+  cat("Getting kNN of mapped neigbors ..\n")
+  smaller.knn <- FNN::get.knn(smaller,k=200)$nn.index
+  rownames(smaller.knn) <- small.cells
+
+  numBiggerpairssmoothed <-  unlist(lapply(1:length(numBiggerpairs),function(i){
+    mean(numBiggerpairs[smaller.knn[i,]])
+  }))
+
+  samplingDensity <- numBiggerpairssmoothed/length(big.cells)
+
+  cat("Up-sampling smaller dataset ..\n")
+  set.seed(seed)
+  small.upCells <- sample(small.cells,size = length(big.cells),replace = TRUE,prob = samplingDensity)
+  cat("Finished\n")
+
+
+  smaller.up <- smaller[small.upCells,]
+
+  stopifnot(nrow(smaller.up)==nrow(bigger))
+
+  cat("Both datasets now have ",nrow(bigger), " cells\n")
+
+  cat("% smaller dataset coverage up-on up-sampling: ",round((length(unique(small.upCells))/length(small.cells)) *100,2),"\n")
+
+  if(length(intersect(rownames(smaller),rownames(mat1))) > 0) {
+    list(smaller.up,bigger)
+  } else {
+    list(bigger,smaller.up)
+  }
+
+}
+
+# Function that evenly (randomly) samples larger dataset to smaller one
+# Chunks up and returns list of chunked CCA ATAC/RNA components
+
+chunk_CCA <- function(CCA_1,
+                      CCA_2,
+                      chunkSize=NULL,
+                      seed=123){
+  if(nrow(CCA_1) > nrow(CCA_2)){
+    bigger <- CCA_1
+    smaller <- CCA_2
+  } else {
+    bigger <- CCA_2
+    smaller <- CCA_1
+  }
+
+  if(is.null(rownames(bigger)) | is.null(rownames(smaller)))
+    stop("CCA matrices must have valid cell barcode names as rownames ..\n")
+
+  # Shuffle them to make sure there's no bias in chunking
+  set.seed(seed)
+  bigger <- bigger[sample(1:nrow(bigger),nrow(bigger),replace = FALSE),]
+  smaller <- smaller[sample(1:nrow(smaller),nrow(smaller),replace = FALSE),]
+
+  cat("Number of cells in bigger dataset: ",nrow(bigger),"\n")
+  cat("Number of cells in smaller dataset: ",nrow(smaller),"\n")
+  cat("Difference in cell count between 2 datasets: ",nrow(bigger) - nrow(smaller),"\n")
+
+  if(is.null(chunkSize))
+     chunkSize <- nrow(smaller)
+
+  cat("Chunking larger dataset to match smaller datset ..\n")
+  cat("Chunk size n = ",chunkSize," cells\n")
+
+  frac <- nrow(bigger) %/% chunkSize # Number of iterations of smaller in bigger
+  remain <- nrow(bigger) %% chunkSize # Extra amount we have to sample after even chunking
+
+  cat("Total number of chunks: ",length(1:frac) + sum(remain > 0),"\n")
+
+  bigCells <- c()
+  smallCells <- c()
+
+  set.seed(seed)
+  chunkList <- list()
+
+  for(i in 1:frac){
+    # What has already not been sampled
+    bigCellsBag <- rownames(bigger)[!rownames(bigger) %in% bigCells]
+    smallCellsBag <- rownames(smaller) # Sample from all cells
+
+    # Fetch chunk for each dataset
+    bigCellsChunk <- sample(bigCellsBag,chunkSize,replace=FALSE)
+    smallCellsChunk <- sample(smallCellsBag,chunkSize,replace=FALSE)
+
+    # Update wha thas been sampled already
+    bigCells <- c(bigCells,bigCellsChunk)
+    smallCells <- c(smallCells,smallCellsChunk)
+
+    # List of bigger and smaller CCA PCs for chunk
+    # NOTE: Each chunk is always returned as Bigger 1st, smaller 2nd (ATAC, then RNA for us)
+    chunkList[[i]] <- list(bigger[bigCellsChunk,],
+                          smaller[smallCellsChunk,])
+  }
+
+
+
+
+  # Add extra cells for last uneven chunk (if any)
+  if(remain > 0){
+  chunkList[[i+1]] <- list(bigger[rownames(bigger)[!rownames(bigger) %in% bigCells],],
+                           smaller[sample(rownames(smaller),remain,replace=FALSE),])
+  }
+  chunkList
+}
+
+
+umap_knn_graph <-function(x, #Input data on which we compute the knn graph
+                          umap_dim = 5, # Dimensionality of the embedded UMAP space
+                          umap_n_nerighbors = 30, # Number of neighbors for computing the UMAP
+                          k = 5,
+                          seed){# Number of neighbors for computing the KNN graph{
+
+  library(uwot)
+
+  # UMAP embedding of data
+  set.seed(seed)
+  umap_embedding <- uwot::umap(x, n_neighbors = umap_n_nerighbors, n_components = umap_dim)
+
+  # Get KNN for all cells
+  all_knn <- get.knn(umap_embedding, k = k)
+  n_data <- dim(x)[1]
+
+  # Construct adjacency matrix of knn graph
+  knn_adj_mtx <- array(0, dim = c(n_data, n_data))
+  for (i in 1:n_data) knn_adj_mtx[i,all_knn$nn.index[i,]] <- 1
+
+  # We make the graph undirected (make the adjacency matrix a symmetric matrix)
+  knn_adj_mtx <- knn_adj_mtx + t(knn_adj_mtx)
+
+  # Initialize a graph object using the adjacency matrix
+  knn_graph <- graph_from_adjacency_matrix(knn_adj_mtx, mode = "undirected")
+  rm(knn_adj_mtx)
+
+  knn_graph
+}
+
+
+# This function takes in the output of the fullmatch function and sort the results into a list of ATAC-RNA pairs
+get_pair_list <- function(cell_matches, # The output object of fullmatch or pairmatch in the package optmatch
+                          ATAC_barcodes, # Barcode of ATAC cells, must match the order of IDs in cell_matches.
+                          #e.g. ATAC_1 in cell matches should correspond to the first element in ATAC_barcodes
+                          RNA_barcodes # Barcode of RNA cells, must match the order of IDs in cell_matches.
+                          #e.g. RNA_1 in cell matches should correspond to the first element in RNA_barcodes
+){
+
+  cell_matches <- sort(cell_matches) # Sort to get ATAC, RNA tuples
+
+  if(length(cell_matches)==0)
+    stop("Matches could not be found .. Perhaps try adjusting the constraints to allow optimal matching to be solved?\n")
+
+  if(any(is.na(cell_matches)))
+    warning("NA pairs exist ..\n")
+
+  # Currently the result list contain cells paired to multiple other cells
+  # If a cell is paired to k cells, we duplicate this cell k times to make k pairs
+  # Thus we generate a new list consisting pairs of 1 ATAC - 1 RNA cells
+  # We also make sure that in a pair, the first ID is ATAC and the second ID is RNA
+  matches <- character()
+  pair_ids <- unique(unname(cell_matches))
+  for (pair_id in 1:length(pair_ids)){
+
+    new_match <- names(cell_matches[unname(cell_matches)== pair_ids[pair_id]])
+    new_match_ATAC <- new_match[splitAndFetch(new_match,"_",1) == "ATAC"]
+    new_match_RNA <- new_match[splitAndFetch(new_match,"_",1) == "RNA" ]
+    new_match <- vector()
+    if (length(new_match_ATAC) > length(new_match_RNA)){
+      new_match[seq(1, 2*length(new_match_ATAC), 2)] <- new_match_ATAC
+      new_match[seq(2, 2*length(new_match_ATAC), 2)] <- rep(new_match_RNA, length(new_match_ATAC))
+    } else {
+      new_match[seq(1, 2*length(new_match_RNA), 2)] <- rep(new_match_ATAC, length(new_match_RNA))
+      new_match[seq(2, 2*length(new_match_RNA), 2)] <- new_match_RNA
+    }
+    matches <- c(matches, new_match)
+  }
+
+  # Make sure pair groupings (factors) are adjacent
+  #stopifnot(all.equal(cell_matches[seq(1,length(cell_matches),2)],cell_matches[seq(2,length(cell_matches),2)],check.attributes=FALSE))
+
+  ATAC_IDs <- matches[seq(1,length(matches),2)] # Names of ATAC cells
+  RNA_IDs <- matches[seq(2,length(matches),2)] # Names of RNA cells
+
+  # Checking if ATAC and RNA tuples are concordant
+  stopifnot(all(splitAndFetch(ATAC_IDs,"_",1) %in% "ATAC"))
+  stopifnot(all(splitAndFetch(RNA_IDs,"_",1) %in% "RNA"))
+
+  # This is just to make sure 1-1, with the names we gave
+  # (can still comprise actual doublets from upsampling if any)
+  #stopifnot(all.unique(ATACp) & all.unique(RNAp))
+
+  # Get corresponding index relative to input matrix order
+  ATAC_inds <- as.numeric(splitAndFetch(ATAC_IDs,"_",2))
+  RNA_inds <- as.numeric(splitAndFetch(RNA_IDs,"_",2))
+
+  matches_mat <- matrix(c(ATAC_inds,RNA_inds),ncol=2,byrow = FALSE) # ATAC col1, RNA col2
+
+  cat("Assembling pair list ..\n")
+  # Make data frame of matches
+
+  pair_df <- data.frame("ATAC"=ATAC_inds,
+                        "RNA"=RNA_inds)
+
+  pair_df <- pair_df %>% arrange(ATAC)
+
+  # Convert to labels if they exist
+  pair_df$ATAC <- ATAC_barcodes[pair_df$ATAC] # ATAC cell labels
+  pair_df$RNA <- RNA_barcodes[pair_df$RNA] # RNA cell labels
+
+  pair_df
+}
+
+
+# Main matching function.
+# By default, will return a data frame of pairs
+# Uses names of barcodes if present in input PC matrices (rownames)
+cell_pairing <- function(ATACpcs, # Input ATAC single cell PCs obtained from Running CCA dimensionality reduction. Shape: (n_ATAC_cells, n_PCs)
+                         RNApcs,# Input ATAC single cell PCs obtained from Running CCA dimensionality reduction. Shape: (n_RNA_cells, n_PCs)
+                         mode = "geodesic",# Mode of pairing. One of "geodesic", "greedy", "optmatch"
+                         tol = 0.0001, # tol times the number of subjects to be matched specifies the extent to which fullmatch's
+                         #output is permitted to differ from an optimal solution to the original problem,
+                         # for details on this tol parameter, see the documentation of optmatch. Look for function fullmatch
+                         # If mode is specified to be "geodesic", then we need to provide the below parameters.
+                         search_range = 0.2, # This determines the size of the search knn. search_range * total number of cells = size of knn.
+                         max_multimatch = 5, # Maximum number of cells allowed to be matched to each cell.
+                         umap_knn_k = 30,
+                         min_subgraph_size=50, # Minimum number of cells (ATAC/RNA each) needed for pairing in a given subgraph. Will skip subgraphs with fewer than these cells
+                         cca_umap_df = NULL, # Optional umap of all (ATAC + RNA cells) to visualize UMAP of cells from each chunk being paired, colored by subgraph
+                         seed=123, # Random seed for subgraph UMAP and for down-sampling if subgraphs are imbalanced
+                         # If mode is specified to be "optmatch", then we need to provide the below parameters.
+                         doPermutation=FALSE, # Test FDR on pair?
+                         returnDistMat=FALSE, # Return the sparse distance matrix used for matching?
+                         k=300, # k-NN parameter used for applying constraints on ATAC-RNA pairs
+                         nCores=1,
+                         sanityLoop=FALSE,
+                         forceSymmetry=TRUE # ATAC and RNA have to be same dimensions
+){
+
+  library(igraph)
+  library(FNN)
+  library(pracma)
+  library(uwot)
+
+  # For now we pool ATAC cells and RNA cells to delineate a manifold
+  all_pcs <- rbind(ATACpcs, RNApcs)
+  n_cells <- dim(all_pcs)[1]
+
+  if (mode == "geodesic"){
+    cat("\n\n")
+    cat("Constructing KNN graph for computing geodesic distance ..\n")
+    # Get UMAP-based KNN graph
+    knn_graph <- umap_knn_graph(all_pcs,k=umap_knn_k,seed = seed)
+
+    cat("Computing graph-based geodesic distance ..\n")
+    # Compute shortest paths between all cell pairs. We checked that this returns a symmetric matrix
+    shortest_paths <- shortest.paths(knn_graph)
+
+    # Find connected subgraphs
+    subgraphs <- clusters(knn_graph)
+    cat("# KNN subgraphs detected:\n", length(unique(subgraphs$membership)),"\n")
+
+    if(!is.null(cca_umap_df)){
+      cat("Visualizing subgraph for cells based on original CCA UMAP coords provided..\n")
+      sub_umap <- cca_umap_df[rownames(all_pcs),]
+      sub_umap$subgraph_clust <- subgraphs$membership
+
+      gSub <- ggplot(sub_umap,aes(x=UMAP1,y=UMAP2,color=factor(subgraph_clust))) +
+        geom_point(size=0.1) + theme_classic() +
+        guides(colour = guide_legend(override.aes = list(size=3)))
+      print(gSub)
+    }
+
+
+    all_pairs <- NULL
+    
+    #k_pairing <- 10 + n_cells * search_range
+    #size_threshold <- k_pairing # Subgraphs with fewer nodes than this threshold would be skipped
+
+    cat("Skipping subgraphs with either ATAC/RNA cells fewer than: ",min_subgraph_size," ..\n")
+
+    # Go through each subgraph
+    for (subgraph_ind in unique(subgraphs$membership)){
+
+      cat("Pairing cells for subgraph No.", subgraph_ind,"\n")
+
+      # Retrieve the subgraph
+      subgraph_nodes <- subgraphs$membership == subgraph_ind
+      knn_subgraph <- induced_subgraph(knn_graph, which(subgraph_nodes))
+
+      # Use down-sampling to make sure in this subgraph the number of ATAC and RNA cells are balanced
+      subgraph_cells <- c(rownames(ATACpcs), rownames(RNApcs))[subgraph_nodes]
+      n_ATAC <- sum(subgraph_cells %in% rownames(ATACpcs))
+      n_RNA <- sum(subgraph_cells %in% rownames(RNApcs))
+
+      cat("Total ATAC cells in subgraph: ",n_ATAC,"\n")
+      cat("Total RNA cells in subgraph: ",n_RNA,"\n")
+
+      subgraph_ATAC_pcs <- ATACpcs[subgraph_nodes[1:dim(ATACpcs)[1]],]
+      subgraph_RNA_pcs <- RNApcs[subgraph_nodes[(dim(ATACpcs)[1] + 1):n_cells],]
+
+      if (n_ATAC > n_RNA){
+        set.seed(seed)
+        subgraph_ATAC_pcs <- subgraph_ATAC_pcs[sample(1:n_ATAC, n_RNA, replace = FALSE),]
+      } else if (n_ATAC < n_RNA){
+        set.seed(seed)
+        subgraph_RNA_pcs <- subgraph_RNA_pcs[sample(1:n_RNA, n_ATAC, replace = FALSE),]
+      }
+
+      if(is.null(nrow(subgraph_ATAC_pcs)) | is.null(nrow(subgraph_RNA_pcs))){
+        message("Down-sampling within subgraph between assays led to 0 cells in one assay..\n")
+        message("Skipping current subgraph\n")
+        next
+      }
+
+      # Subset the original geodesic distance matrix to get the geodesic distance matrix for the subgraph
+      subgraph_geodist <- shortest_paths[match(rownames(subgraph_ATAC_pcs), rownames(all_pcs)),
+                                         match(rownames(subgraph_RNA_pcs), rownames(all_pcs))]
+
+      subgraph_size <- dim(subgraph_geodist)[1]
+
+      cat("Subgraph size: ",subgraph_size,"\n")
+
+      # TO AVOID MAJOR SUBGRAPH(S) WERE BEING SKIPPED SOMETIMES
+      size_threshold <- ceiling((nrow(subgraph_ATAC_pcs) + nrow(subgraph_RNA_pcs)) * search_range)
+      k_pairing <- size_threshold
+
+      cat("Search threshold being used: ",k_pairing,"\n")
+
+      if (subgraph_size < size_threshold | subgraph_size < min_subgraph_size) {
+        message("Insufficient number of cells in subgraph. Skipping current subgraph")
+        next
+      }
+
+      # We also calculate euclidean distance matrix
+      subgraph_eucdist <- distmat(subgraph_ATAC_pcs, subgraph_RNA_pcs)
+
+      # Find KNN based on geodesic distances.
+      print("Constructing KNN based on geodesic distance to reduce search pairing search space")
+      geodist_knn <- array(-1, dim=dim(subgraph_geodist))
+      for (i in 1:subgraph_size){
+
+        # Find RNA cells in the KNN of each ATAC cell
+        geodist_threshold <- sort(subgraph_geodist[i,])[k_pairing]
+        knn_ind <- subgraph_geodist[i,] < geodist_threshold
+        geodist_knn[i, knn_ind] <- subgraph_eucdist[i, knn_ind]
+
+        # Find ATAC cells in the KNN of each RNA cell
+        geodist_threshold <- sort(subgraph_geodist[,i])[k_pairing]
+        knn_ind <- subgraph_geodist[,i] < geodist_threshold
+        geodist_knn[knn_ind, i] <- subgraph_eucdist[knn_ind, i]
+
+      }
+
+      # For an ATAC-RNA cell pair, if neither of them are in the KNN of the other, we set their distance to be inf
+      geodist_knn[geodist_knn < 0] <- Inf
+
+      # Add rownames to the matrix
+      rownames(geodist_knn) <- paste0("ATAC_",1:subgraph_size)
+      colnames(geodist_knn) <- paste0("RNA_",1:subgraph_size)
+
+      print(paste("Number of cells being paired:",
+                  dim(geodist_knn)[1],
+                  "ATAC and",
+                  dim(geodist_knn)[1],
+                  " RNA cells"))
+
+      cat("Determing pairs through optimized bipartite matching ..\n")
+      options("optmatch_max_problem_size" = Inf)
+      cell_matches <- suppressWarnings(optmatch::fullmatch(optmatch::as.InfinitySparseMatrix(as.matrix(geodist_knn)),
+                                                           tol = tol,
+                                                           min.controls = 1 / max_multimatch,
+                                                           max.controls = max_multimatch))
+      pair_list <- get_pair_list(cell_matches,
+                                 rownames(subgraph_ATAC_pcs),
+                                 rownames(subgraph_RNA_pcs))
+
+      cat("Finished!\n")
+      
+      # Append the results for this subgraph to the list of all results
+      all_pairs <- rbind(all_pairs, pair_list)
+    }
+  }
+
+  if (mode == "greedy"){
+
+    n_ATAC <- dim(ATACpcs)[1]
+    n_RNA <- dim(RNApcs)[1]
+    if (n_ATAC >= n_RNA){
+      print("Pairing all RNA cells to nearest ATAC cells")
+      pair_knn <- get.knnx(data = ATACpcs, query = RNApcs, k = 1)
+      ATAC_paired <- rownames(ATACpcs)[pair_knn$nn.index]
+      RNA_paired <- rownames(RNApcs)
+    } else{
+      print("Pairing all ATAC cells to nearest RNA cells")
+      pair_knn <- get.knnx(data = RNApcs, query = ATACpcs, k = 1)
+      ATAC_paired <- rownames(RNApcs)[pair_knn$nn.index]
+      RNA_paired <- rownames(ATACpcs)
+    }
+    all_pairs <- data.frame(ATAC=ATAC_paired,RNA=RNA_paired,stringsAsFactors=FALSE)
+  }
+
+  return(all_pairs)
+
+}
+
+# Wrapper function for running ATAC/RNA geodesic pairing per chunk
+chunk_pair_geo <- function(ATACpcs,
+                           RNApcs,
+                           ...){ # Addition parameters pased to cell_pairing function (see below)
+
+  if(nrow(ATACpcs)!=nrow(RNApcs)){
+    cat("Running geodesic pairing in after chunking data ..\n")
+
+    # Chunk up data (larger to smaller)
+    chunkList <- chunk_CCA(CCA_1 = ATACpcs,CCA_2 = RNApcs,seed = 123)
+
+    # Chunk lists always returned with larger assay first, then smaller (list of two matrices)
+    # Match to input ATAC/RNA specification
+    if(all(rownames(chunkList[[1]][[1]]) %in% rownames(ATACpcs) & !rownames(chunkList[[1]][[2]]) %in% rownames(ATACpcs))){
+      ATAC.i <- 1
+      RNA.i <- 2
+    } else {
+      ATAC.i <- 2
+      RNA.i <- 1
+    }
+    
+    
+    pairList <- list()
+    for(i in 1:length(chunkList)){
+      cat("\nChunk # ",i,"\n")
+      cat("No. cells in chunk: ",nrow(chunkList[[i]][[1]]),"\n\n")
+
+      pairList[[i]] <-  cell_pairing(ATACpcs = chunkList[[i]][[ATAC.i]],
+                                     RNApcs = chunkList[[i]][[RNA.i]],
+                                     mode = "geodesic",...)
+    }
+
+    return(do.call('rbind',pairList))
+
+  } else {
+    return(cell_pairing(ATACpcs = ATACpcs,RNApcs = RNApcs,mode = "geodesic",...))
+  }
+}
+```
+
+```{r}
+DefaultAssay(mo)<-"ATAC"
+ATAC.se <- SummarizedExperiment(assays = list(counts = mo[["ATAC"]]@data) , rowRanges =mo@assays$ATAC@ranges, colData = mo@meta.data)
+library(foreach)
+library(chromVAR)
+library(chromVARmotifs)
+
+load(file = "~/mm10_refSeq.RData")
+
+data(mm10TSSRanges)
+
+
+# seqlevelsStyle(mm10TSSRanges)<-"UCSC"
+# seqlevels(mm10TSSRanges, pruning.mode = "coarse")<- seqlevels(mo@assays$ATAC@ranges)
+# hg38TSSRanges$gene_name <- hg38TSSRanges$Gene_symbol
+# hg38TSSRanges<- hg38TSSRanges[which(!is.na(hg38TSSRanges$gene_name))]
+
+
+
+RNAmat<- mo[["RNA"]]@data%>% as.sparse()
+
+# Use 8 cores here
+cisCor <- runGenePeakcorr(ATAC.se = ATAC.se,
+                           RNAmat = RNAmat,
+                           genome = "mm10",
+                          windowPadSize = 50000,
+                           nCores = detectCores(),
+                           n_bg = 100,
+                           p.cut = NULL)
+
+write.csv(cisCor, file.path(RES_DIR, "cisCOR_figR.csv"))
+ 
+
+cisCor<- read.csv(file.path(RES_DIR, "cisCOR_figR.csv"))
+
+# Filter associations using correlation p-value 
+cisCor.filt <- cisCor %>% dplyr::filter(pvalZ <= 0.05)
+
+dorcGenes <- dorcJplot(dorcTab = cisCor.filt,
+                       cutoff = 7,
+                       returnGeneList = TRUE)
+
+
+sigGP <- cisCor[cisCor$Gene %in% dorcGenes,]
+dim(sigGP)
+
+rownames(RNAmat) <- gsub(x=rownames(RNAmat),pattern = "-",replacement = "",fixed = TRUE)
+
+dorcMat<- getDORCScores(ATAC.se, dorcTab = cisCor.filt, geneList = dorcGenes)
+
+colnames(dorcMat)
+
+ews_mo<- loadArchRProject("~/ews_mo")
+
+lsi <- ews_mo@reducedDims@listData$IterativeLSI@listData$matSVD
+
+rownames(lsi)<- gsub("Mo#", "Mo_",rownames(lsi) )
+
+lsi <- lsi[which(rownames(lsi) %in% colnames(dorcMat)),]
+dorcMat <- dorcMat[,which(colnames(dorcMat) %in% rownames(lsi))]
+ATAC.se <- ATAC.se[, which(colnames(ATAC.se) %in% rownames(lsi))]
+RNAmat <- RNAmat[, which(colnames(RNAmat) %in% rownames(lsi))]
+
+lsi.knn <- FNN::get.knn(lsi,k=30)$nn.index
+rownames(lsi.knn) <- colnames(dorcMat)
+
+library(doParallel)
+dorcMat.smoothed <- smoothScoresNN(lsi.knn,dorcMat,nCores = 4)
+stopifnot(all.equal(rownames(dorcMat.smoothed),dorcGenes))
+
+rm(DORC.SE)
+gc()
+
+# Just so that the smoothing function will work, since it checks for matching attributes
+rownames(lsi.knn) <- colnames(RNAmat)
+
+# Run only on TFs to save time
+human_pwms_v3 <- readRDS("~/cisBP_human_pfms_2021.rds")
+rnaMat.smoothed <- smoothScoresNN(NNmat = lsi.knn,TSSmat = RNAmat,nCores = 4,geneList=intersect(rownames(RNAmat),names(human_pwms_v3)))
+gc()
+
+# ---------------------------------------------------------------------------------- Run FigR
+
+stim_FigR <- runFigR(ATAC.se = ATAC.se,
+                           dorcK = 30,
+                           dorcTab = sigGP,
+                           genome = "hg38", 
+                           dorcMat = dorcMat.smoothed,
+                           rnaMat = rnaMat.smoothed,
+                           n_bg = 50,
+                           nCores = 4)
+
+library(ggplot2)
+library(ggrastr)
+library(BuenColors)
+
+devtools::install_github("caleblareau/BuenColors")
+
+paletteContinuous("solar_extra")
+
+gAll <- ggplot(stim_FigR,aes(Corr.log10P,Enrichment.log10P,color=Score)) + 
+  geom_point_rast(size=0.01,shape=16) +
+  theme_classic() +
+  scale_color_gradientn(colours = jdb_palette("solar_extra"),limits=c(-2.5,2.5),oob = scales::squish)
+
+# Mean plot
+library(ggrepel)
+rankDrivers(figR.d = stim_FigR) 
+
+# Scatter plot of drivers associated with a given DORC
+plotDrivers(figR.d = stim_FigR,marker = "MX1")
+plotDrivers(figR.d = stim_FigR,marker = "REL")
+plotDrivers(figR.d = stim_FigR,marker = "TRAF1")
+
+# Load DORC-implicated GWAS SNP P mat
+SNPPmat <- readRDS("./data/GWAS/GWAS_DORC_SNPoV_unfiltered_P_mat.rds")
+SNPDORCs <- rownames(SNPPmat)  # DORCs of interest
+length(SNPDORCs)
+
+# Heatmap 
+figR_heat <- plotfigRHeatmap(figR.d = stim_FigR,
+                             score.cut = 1.5,
+                             DORCs = SNPDORCs,
+                             column_names_gp=gpar(fontsize=5),
+                             show_row_dend = FALSE,
+                             row_names_side = "left")
+
+# D3Network
+plotfigRNetwork(stim_FigR,score.cut = 1.5,DORCs = SNPDORCs)
+
+
+```
+
+
+
+
+
+
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+

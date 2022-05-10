@@ -1,0 +1,652 @@
+---
+title: "Load MO"
+author: "OW"
+date: "10/15/21"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r, warning=FALSE, message=FALSE, warning=FALSE, echo=F}
+graphics.off()
+rm(list=ls())
+knitr::opts_chunk$set(fig.width=8, fig.height=6,dpi=300,
+                      echo=FALSE, warning=FALSE, message=FALSE)
+knitr::opts_chunk$set(dev.args=list(bg="transparent"))
+ROOT_DIR<-"~/Fred Hutchinson Cancer Research Center"
+stem<-"Myeloma Exhaustion - General/allo1"
+DATA_DIR <- file.path(ROOT_DIR,  stem, "data")      # SPECIFY HERE
+RES_DIR  <- file.path(ROOT_DIR,  stem, "res")     # SPECIFY HERE
+RMD_DIR  <- file.path(ROOT_DIR,  stem, "rmd")     # SPECIFY HERE
+CDS_DIR <- file.path(ROOT_DIR,  stem, "cds")
+FIG_DIR <- file.path(ROOT_DIR,  stem, "figs")
+
+suppressPackageStartupMessages({
+  library(monocle3)
+  library(m3addon)
+  library(reticulate)
+  library(openxlsx)  
+  library(dplyr)
+  library(Matrix)
+  library(ggplot2)
+  library(xfun)
+  library(pals)
+  library(RColorBrewer)
+  library(Signac)
+  library(Seurat)
+  library(ggplot2)
+  library(future)
+  library(GenomicRanges)
+  library(EnsDb.Mmusculus.v79)
+  library(ComplexHeatmap)
+  library(BSgenome.Mmusculus.UCSC.mm10)
+  library(scATACutils)
+  library(JASPAR2020)
+  library(TFBSTools)
+  library(patchwork)
+  library(stringr)
+  library(ggsignif)
+  library(ggpubr)
+})
+
+set.seed(1234)
+
+cd8_cols <- c(brewer.purd(9)[4],brewer.purples(10)[9])
+cd8_clus <- brewer.set2(8)
+cd4_cols <- c(brewer.orrd(4)[2],brewer.oranges(10)[7])
+cd4_clus <- c("hotpink3", "chartreuse4", "mediumorchid4", "steelblue2" , "chocolate2")
+h_cols <-rev(brewer.pal(name = "RdYlBu", n = 7))
+
+cd4<- readRDS(file.path(CDS_DIR, "Cd4_101521.rds"))
+cd8<- readRDS(file.path(CDS_DIR, "Cd8_101521.rds"))
+
+use_virtualenv("/Users/owaltner/.virtualenvs/reticulate", required = T)
+py_config()
+```
+
+```{bash}
+cd '/Users/owaltner/Fred Hutchinson Cancer Research Center/Myeloma Exhaustion - General/allo1'
+
+pf=AlloSCT
+outdir=data/$pf/peaks   
+macs2 callpeak -t data/$pf/outs/atac_fragments.tsv.gz -g 2.7e+09 -f BED --nomodel --extsize 200 --shift -100 -n macs2 --outdir $outdir
+
+pf=PTCy
+outdir=data/$pf/peaks   
+macs2 callpeak -t data/$pf/outs/atac_fragments.tsv.gz -g 2.7e+09 -f BED --nomodel --extsize 200 --shift -100 -n macs2 --outdir $outdir
+```
+
+```{r Make object}
+samps<-c("AlloSCT", "PTcy")
+
+macs_peaks<-lapply(samps, function(sample){
+  peaks <- read.table(file = file.path(DATA_DIR, sample, "peaks/macs2_peaks.narrowPeak"))
+  colnames(peaks)<-c("chr start end name integer_score none fold_enrichment log10pvalue log10qvalue relative_summit_pos") %>% strsplit(" ") %>% unlist()
+  peaks
+})
+
+macs_granges<-lapply(macs_peaks, makeGRangesFromDataFrame)
+macs_cgranges<-do.call(c, macs_granges)
+macs_mo.peaks <- reduce(x = macs_cgranges)
+
+peakwidths <- width(macs_mo.peaks)
+macs_mo.peaks <- macs_mo.peaks[peakwidths  < 10000 & peakwidths > 20]
+macs_mo.peaks <- keepStandardChromosomes(macs_mo.peaks, pruning.mode = "coarse")
+
+
+meta<-lapply(samps, function(sample){
+  tab<-read.table(
+  file = file.path(DATA_DIR, sample, "outs/per_barcode_metrics.csv"),
+  stringsAsFactors = FALSE,
+  sep = ",",
+  header = TRUE,
+  row.names = 1
+  )
+  tab[tab$is_cell!=0, ]
+})
+
+frags<-lapply(1:length(samps), function(i){
+  CreateFragmentObject(
+    path = file.path(DATA_DIR, samps[i], "outs/atac_fragments.tsv.gz"),
+    cells = meta[[i]]$gex_barcode)
+  })
+
+
+frags<-lapply(frags, function(frag){
+  frag@path<-gsub("/Users/owaltner/Fred Hutchinson Cancer Research Center/Myeloma Exhaustion - General/allo1/data", DATA_DIR, frag@path )
+  frag
+})
+
+
+macs_counts <- lapply(1:length(samps), function(i){
+  FeatureMatrix(
+  fragments = frags[[i]], process_n = 5000,
+  features = macs_mo.peaks,
+  cells = rownames(meta[[i]]))
+})
+
+# cellranger_counts<-counts
+counts<-macs_counts
+
+
+# extract gene annotations from EnsDb
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+
+# change to UCSC style 
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "mm10"
+
+
+seus<-lapply(1:length(samps), function(i){
+  raw<-Read10X_h5(file.path(DATA_DIR, samps[[i]], "outs", "raw_feature_bc_matrix.h5"))
+  seu<-CreateSeuratObject(
+    counts = raw$`Gene Expression`[,colnames(counts[[i]])], assay= "RNA", meta.data = meta[[i]])
+  seu[["ATAC"]]<-CreateChromatinAssay(counts[[i]], fragments = frags[[i]], sep = c(":", "-"), annotation = annotations)
+  seu$dataset<-samps[i]
+  seu
+})
+
+mo <- merge(
+  x = seus[[1]],
+  y = seus[2:length(seus)],
+  add.cell.ids = samps
+)
+
+```
+
+```{r RNA/ATAC QC}
+
+DefaultAssay(mo) <- "ATAC"
+mo$Frip<-mo$atac_peak_region_fragments/mo$atac_fragments
+mo$log_ATAC<-log10(mo$nCount_ATAC)
+
+# compute TSS enrichment score per cell
+mo<- TSSEnrichment(object = mo, fast = F)
+mo <- NucleosomeSignal(mo)
+
+DefaultAssay(mo) <- "RNA"
+mo[["percent.mt"]] <- PercentageFeatureSet(mo, pattern = "^mt-")
+mo$log_RNA<-log10(mo$nCount_RNA)
+
+VlnPlot(t, features =  c("nCount_RNA", "nCount_ATAC", "TSS.enrichment", "nucleosome_signal", "TSS.percentile", "Frip", "percent.mt"), group.by = "dataset", pt.size = 0)
+
+t<- subset(
+  x = mo,
+  subset = nCount_ATAC < 100000 &
+    nCount_RNA < 50000 &
+    nucleosome_signal < 1.5 &
+    TSS.enrichment > 5&
+    percent.mt <= 10 &
+    log_ATAC >= 3 &
+    log_RNA >= 3 &
+    Frip >= .4 &
+    TSS.percentile > .5
+)
+
+
+DefaultAssay(t)<- "RNA"
+saveRDS(mo, "MO_unfiltered_101521.rds")
+saveRDS(t, "MO_filtered_101521.rds")
+```
+
+```{r Create cd8 and cd4 objects}
+
+cd8<-subset(x = t, subset = Cd8a > 0 & Cd4 == 0)#Cd8b not found
+
+cd4<-subset(x = t, subset = Cd4 > 0 & Cd8a == 0)#Cd8b not found
+
+```
+
+```{r CD8 SCT}
+cd8<-FindVariableFeatures(cd8)
+cd8<-ScaleData(cd8)
+cd8 <- SCTransform(cd8, method = "glmGamPoi", vars.to.regress = "percent.mt")
+cd8 <- RunPCA(cd8, features = VariableFeatures(cd8))
+ElbowPlot(cd8, ndims = 30)
+cd8<-RunUMAP(cd8, dims = 1:15, verbose = T, reduction.name = "SCT_UMAP")
+DimPlot(cd8, reduction = "SCT_UMAP", group.by = "dataset", cols = cd8_cols )
+```
+
+```{r CD4 SCT}
+cd4<-FindVariableFeatures(cd4)
+cd4<-ScaleData(cd4)
+cd4 <- SCTransform(cd4, method = "glmGamPoi", vars.to.regress = "percent.mt")
+cd4 <- RunPCA(cd4, features = VariableFeatures(cd4))
+ElbowPlot(cd4, ndims = 30)
+cd4<-RunUMAP(cd4, dims = 1:12, verbose = T, reduction.name = "SCT_UMAP")
+DimPlot(cd4, reduction = "SCT_UMAP", group.by = "dataset", cols = cd4_cols)
+```
+
+```{r CD8 ATAC}
+DefaultAssay(cd8) <- "ATAC"
+cd8 <- RunTFIDF(cd8)
+cd8 <- FindTopFeatures(cd8, min.cutoff = 'q0')
+cd8<- RunSVD(cd8)
+ElbowPlot(cd8, ndims = 30)
+cd8<- RunUMAP(cd8, reduction = 'lsi', dims = 1:15, reduction.name = "ATAC_UMAP")
+DimPlot(cd8, group.by = "dataset", label=T, reduction = "ATAC_UMAP", cols = cd8_cols)+ggtitle("ATAC UMAP")
+```
+
+```{r CD4 ATAC}
+DefaultAssay(cd4) <- "ATAC"
+cd4<- RunTFIDF(cd4)
+cd4<- FindTopFeatures(cd4, min.cutoff = 'q0')
+cd4<- RunSVD(cd4)
+cd4<- RunUMAP(cd4, reduction = 'lsi', dims = 1:12, reduction.name = "ATAC_UMAP")
+ElbowPlot(cd4, ndims = 30)
+DimPlot(cd4, group.by = "dataset", label=T, reduction = "ATAC_UMAP", cols = cd4_cols)+ggtitle("ATAC UMAP")
+```
+
+```{r CD8 WNN}
+cd8 <- FindMultiModalNeighbors(cd8, reduction.list = list("pca", "lsi"), dims.list = list(1:15, 1:15))
+cd8<- RunUMAP(cd8, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+DimPlot(cd8, group.by = "dataset", reduction = "wnn.umap", label = T, cols = cd8_cols)+ggtitle("WNN UMAP")
+```
+
+```{r CD4 WNN}
+cd4 <- FindMultiModalNeighbors(cd4, reduction.list = list("pca", "lsi"), dims.list = list(1:12, 1:12))
+cd4<- RunUMAP(cd4, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+DimPlot(cd4, group.by = "dataset", reduction = "wnn.umap", label = T, cols = cd4_cols)+ggtitle("WNN UMAP")
+```
+
+```{r CD8 QC stats}
+VlnPlot(
+  object = cd8,
+  features = c("TSS.percentile", "log_RNA", "percent.mt", "log_ATAC", "TSS.enrichment", "nucleosome_signal", "Frip"),
+  group.by = "dataset",
+  ncol = 4,
+  pt.size = 0,
+  cols = c(brewer.purd(9)[4],brewer.purples(10)[9]))
+```
+
+```{r CD8 counts}
+barplot(table(cd8$dataset), col =c(brewer.purd(9)[4],brewer.purples(10)[9]), ylab = "Count", ylim = c(0,3000), main = "CD8 Count")
+```
+
+```{r CD4 counts}
+barplot(table(cd4$dataset), col =c(brewer.orrd(4)[2],brewer.oranges(10)[7]), ylab = "Count", ylim = c(0,3000), main = "CD4 Count")
+```
+
+```{r CD4 QC stats}
+VlnPlot(
+  object = cd4,
+  features = c("log_RNA", "percent.mt", "log_ATAC", "TSS.enrichment", "nucleosome_signal", "Frip", "TSS.percentile"),
+  group.by = "dataset",
+  ncol = 4,
+  pt.size = 0,
+  cols = c(brewer.orrd(4)[2],brewer.oranges(10)[7]))
+```
+
+```{r Cluster CD8}
+cd8 <- FindNeighbors(cd8, dims = 1:15 )#number of dimensions i used, no need to change
+cd8 <- FindClusters(cd8, resolution = 0.4, graph.name = "wsnn")##0.5 is the default resolution, if you increase the number, you will get more clusters
+DimPlot(cd8, group.by ="seurat_clusters", split.by = "dataset",cols = cd8_clus, reduction = "wnn.umap")
+```
+
+```{r Cluster CD4}
+cd4 <- FindNeighbors(cd4, dims = 1:12 )#number of dimensions i used, no need to change
+cd4 <- FindClusters(cd4, resolution = 0.45, graph.name = "wsnn")
+DimPlot(cd4, group.by ="seurat_clusters", split.by = "dataset", cols = cd4_clus, reduction = "wnn.umap")
+```
+
+```{r Gene Activity}
+DefaultAssay(cd8)<- "ATAC"
+gene.activities <- GeneActivity(cd8)
+
+cd8[['GENE_ACC']] <- CreateAssayObject(counts = gene.activities)
+cd8 <- NormalizeData(
+  object = cd8,
+  assay = 'GENE_ACC',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(cd8$nCount_GENE_ACC)
+)
+DefaultAssay(cd8)<- "GENE_ACC"
+cd8<-ScaleData(cd8)
+
+DefaultAssay(cd4)<- "ATAC"
+gene.activities <- GeneActivity(cd4)
+
+cd4[['GENE_ACC']] <- CreateAssayObject(counts = gene.activities)
+cd4 <- NormalizeData(
+  object = cd4,
+  assay = 'GENE_ACC',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(cd4$nCount_GENE_ACC)
+)
+
+DefaultAssay(cd4)<- "GENE_ACC"
+cd4<-ScaleData(cd4)
+
+```
+
+```{r Add Motifs}
+# Get a list of motif position frequency matrices from the JASPAR database
+pfm <- getMatrixSet(
+  x = JASPAR2020,
+  opts = list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+)
+library(Signac)
+DefaultAssay(cd8)<-"ATAC"
+
+# add motif information
+cd8 <- AddMotifs(
+  object = cd8,
+  genome = BSgenome.Mmusculus.UCSC.mm10,
+  pfm = pfm
+)
+
+
+DefaultAssay(cd4)<-"ATAC"
+
+# add motif information
+cd4 <- AddMotifs(
+  object = cd4,
+  genome = BSgenome.Mmusculus.UCSC.mm10,
+  pfm = pfm
+)
+```
+
+```{r Run ChromVAR}
+cd8 <- RunChromVAR(
+  object = cd8,
+  genome = BSgenome.Mmusculus.UCSC.mm10
+)
+
+cd4 <- RunChromVAR(
+  object = cd4,
+  genome = BSgenome.Mmusculus.UCSC.mm10
+)
+# saveRDS(cd4, file.path(CDS_DIR, "Cd4_101521.rds"))
+# saveRDS(cd8, file.path(CDS_DIR, "Cd8_101521.rds"))
+# saveRDS(t, file.path(CDS_DIR, "MO_filtered_101521.rds"))
+# saveRDS(mo, file.path(CDS_DIR, "MO_unfiltered_101521.rds"))
+```
+
+```{r CD8 SCT cluster heatmap}
+DefaultAssay(cd8)<- "SCT" 
+Idents(cd8)<-"seurat_clusters"
+cd8.markers <- FindAllMarkers(cd8, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)##finds differentially expressed cluster biomarkers
+
+top_n<- cd8.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 20, order_by = avg_log2FC)
+
+DoHeatmap(cd8, features = top_n$gene, group.by = "seurat_clusters", slot = "scale.data", group.colors =  brewer.set2(8))+scale_fill_gradientn(colors = h_cols)
+```
+
+```{r CD8 SCT dataset heatmap}
+DefaultAssay(cd8)<- "SCT" 
+Idents(cd8)<-"dataset"
+cd8.markers <- FindAllMarkers(cd8, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)##finds differentially expressed cluster biomarkers
+
+top_n<- cd8.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 50, order_by = avg_log2FC)##returns most signif top  marker per cluster
+##you can change the n=  to get as many markers as you want
+
+DoHeatmap(cd8, features = top_n$gene, group.by = "dataset", slot = "scale.data", group.colors =  cd8_cols)+scale_fill_gradientn(colors = h_cols)
+```
+
+```{r CD4 SCT cluster heatmap}
+DefaultAssay(cd4)<- "SCT" 
+Idents(cd4)<-"seurat_clusters"
+cd4.markers <- FindAllMarkers(cd4, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)##finds differentially expressed cluster biomarkers
+
+top_n<- cd4.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 20, order_by = avg_log2FC)##returns most signif top  marker per cluster
+##you can change the n=  to get as many markers as you want
+
+DoHeatmap(cd4, features = top_n$gene, group.by = "seurat_clusters", slot = "scale.data", group.colors =  cd4_clus)+scale_fill_gradientn(colors = h_cols)
+```
+
+```{r CD4 SCT datset heatmap}
+DefaultAssay(cd4)<- "SCT" 
+Idents(cd4)<-"dataset"
+cd4.markers <- FindAllMarkers(cd4, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)##finds differentially expressed cluster biomarkers
+
+top_n<- cd4.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 50, order_by = avg_log2FC)##returns most signif top  marker per cluster
+##you can change the n=  to get as many markers as you want
+
+DoHeatmap(cd4, features = top_n$gene, group.by = "dataset", slot = "scale.data", group.colors =  cd4_cols)+scale_fill_gradientn(colors = h_cols)
+```
+
+```{r CD8 Cluster Dot Plot}
+DefaultAssay(cd8)<- "SCT"
+DotPlot(cd8, features = c("Tox","Pdcd1","Lag3","Havcr2","Eomes","Tbx21","Prf1", "Gzmb", "Bach2", "Il7r","Il18r1", "Lef1", "Cd44", "Cd226", "Mki67"), group.by = "seurat_clusters", cols = c("lightgrey", "red3"), col.min = -2.5, col.max = 2.5, dot.min = 0, dot.scale = 5, cluster.idents = F, scale.by = "size", scale.min = NA, scale.max = NA) +theme(axis.text.x=element_text(size=9), axis.text.y=element_text(size=9)) +xlab("Gene") + ylab("Group") + RotatedAxis()
+```
+
+```{r CD4 Cluster Dot Plot}
+DefaultAssay(cd4)<- "SCT"
+DotPlot(cd4, features = c("Foxp3","Tox","Pdcd1","Lag3","Havcr2","Eomes","Tbx21","Prf1", "Gzmb", "Bach2", "Il7r","Il18r1", "Lef1", "Cd44", "Cd226", "Mki67"), group.by = "seurat_clusters", cols = c("lightgrey", "red3"), col.min = -2.5, col.max = 2.5, dot.min = 0, dot.scale = 5, cluster.idents = F, scale.by = "size", scale.min = NA, scale.max = NA) +theme(axis.text.x=element_text(size=9), axis.text.y=element_text(size=9)) +xlab("Gene") + ylab("Group")
+```
+
+```{r Get BACH2 OE stem markers}
+bach2<- Read10X(file.path(DATA_DIR, "GSM4613786/BACH2OE"))
+bach2 <- CreateSeuratObject(bach2, project = "BACH2OE")
+pmig<- Read10X(file.path(DATA_DIR, "GSM4613786/pMIG"))
+pmig <- CreateSeuratObject(pmig, project = "pMIG")
+
+stem <- merge(bach2, y=pmig, add.cell.ids = c("BACH2OE", "pMIG"), project = "Tscm")
+
+stem[["percent.mt"]] <- PercentageFeatureSet(stem, pattern = "^mt-")
+VlnPlot(stem, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+stem <- subset(stem, subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 5)
+stem <- NormalizeData(stem, normalization.method = "LogNormalize", scale.factor = 10000)
+stem <- FindVariableFeatures(stem, selection.method = "vst", nfeatures = 2000)
+
+all.genes <- rownames(stem)
+stem <- ScaleData(stem, features = all.genes)
+stem <- RunPCA(stem, features = VariableFeatures(object = stem))
+
+stem <- RunUMAP(stem, dims = 1:25)
+
+stem <- FindNeighbors(stem, dims = 1:25)
+stem<- FindClusters(stem, resolution = 0.1)
+
+stem.markers <- FindAllMarkers(stem, logfc.threshold = 0.1)
+
+stem.genes<- stem.markers %>% 
+  dplyr::filter(cluster == 0)  %>% 
+  dplyr::filter(p_val < .001)   %>% 
+  dplyr::filter(avg_log2FC > 1)%>% 
+  dplyr::filter(!str_detect(gene, "^Rpl")) %>%
+  dplyr::filter(!str_detect(gene, "^Rps")) 
+
+stem.genes <- c(stem.genes$gene, "Bach2", "Bcl2","Eomes", "Myb", "Tnfsf8")
+
+stem.genes <- list(stem.genes)
+```
+
+```{r CD8 exp of stem markers}
+DefaultAssay(cd8)<-"SCT"
+cd8<- AddModuleScore(cd8, stem.genes, name = "Stem_Like")
+com <-list(c("AlloSCT", "PTcy"))
+
+wilcox.test(x = cd8[,cd8$dataset == "AlloSCT"]$Stem_Like1, y = cd8[,cd8$dataset == "PTcy"]$Stem_Like1)
+
+VlnPlot(cd8, features = "Stem_Like1", group.by = "dataset", pt.size = 0, cols = cd8_cols, log = F, y.max = max(cd8$Stem_Like1) +0.2, slot = "scale.data")+stat_summary(fun="mean", geom = "point")+stat_compare_means(comparisons = com, label = "p.format")
+```
+
+```{r Feature plot CD8 Stem SCT}
+FeaturePlot(cd8, features = "Stem_Like1", max.cutoff = "q95", min.cutoff = "q5" ,cols = c("lightgray", "firebrick2"), reduction = "wnn.umap")
+```
+
+```{r CD8 Access of stem markers}
+DefaultAssay(cd8)<-"GENE_ACC"
+cd8<- AddModuleScore(cd8, stem.genes, name = "Stem_Like_Acc")
+com <-list(c("AlloSCT", "PTcy"))
+
+wilcox.test(x = cd8[,cd8$dataset == "AlloSCT"]$Stem_Like_Acc1, y = cd8[,cd8$dataset == "PTcy"]$Stem_Like_Acc1)
+
+VlnPlot(cd8, features = "Stem_Like_Acc1", group.by = "dataset", pt.size = 0, cols = cd8_cols, log = F, y.max = max(cd8$Stem_Like_Acc1) +0.2, slot = "scale.data")+stat_summary(fun="mean", geom = "point")+stat_compare_means(comparisons = com, label = "p.format")
+```
+
+```{r Feature plot CD8 Stem Accessibility}
+FeaturePlot(cd8, features = "Stem_Like_Acc1", max.cutoff = "q95", min.cutoff = "q5", cols = c("lightgray", "blue"), reduction = "wnn.umap")
+```
+
+```{r CD4 exp of stem markers}
+DefaultAssay(cd4)<-"SCT"
+cd4<- AddModuleScore(cd4, stem.genes, name = "Stem_Like")
+com <-list(c("AlloSCT", "PTcy"))
+
+wilcox.test(x = cd4[,cd4$dataset == "AlloSCT"]$Stem_Like1, y = cd4[,cd4$dataset == "PTcy"]$Stem_Like1, exact = T)
+
+VlnPlot(cd4, features = "Stem_Like1", group.by = "dataset", pt.size = 0, cols = cd4_cols, log = F, y.max = max(cd4$Stem_Like1) +0.2, slot = "scale.data")+stat_summary(fun="mean", geom = "point")+stat_compare_means(comparisons = com, label = "p.format")
+```
+
+```{r Feature plot CD4 Stem SCT}
+FeaturePlot(cd4, features = "Stem_Like1", max.cutoff = "q95", min.cutoff = "q5" ,cols = c("lightgray", "firebrick2"), reduction = "wnn.umap")
+```
+
+```{r CD4 Access of stem markers}
+DefaultAssay(cd4)<-"GENE_ACC"
+cd4<- AddModuleScore(cd4, stem.genes, name = "Stem_Like_Acc")
+com <-list(c("AlloSCT", "PTcy"))
+
+wilcox.test(x = cd4[,cd4$dataset == "AlloSCT"]$Stem_Like_Acc1, y = cd4[,cd4$dataset == "PTcy"]$Stem_Like_Acc1)
+
+VlnPlot(cd4, features = "Stem_Like_Acc1", group.by = "dataset", pt.size = 0, cols = cd4_cols, log = F, y.max = max(cd4$Stem_Like_Acc1) +0.2, slot = "scale.data")+stat_summary(fun="mean", geom = "point")+stat_compare_means(comparisons = com, label = "p.format")
+```
+
+```{r Feature plot CD8 Stem Accessibility }
+FeaturePlot(cd4, features = "Stem_Like_Acc1", max.cutoff = "q95", min.cutoff = "q5", cols = c("lightgray", "blue"), reduction = "wnn.umap")
+```
+
+```{r CD8 Tex markers SCT}
+DefaultAssay(cd8)<-"SCT"
+genes<- read.csv(file.path(DATA_DIR, "Tex_markers_shietinger.csv"))
+tex <- genes %>% dplyr::filter(log2FoldChange > 1) %>% dplyr::filter(pvalue < 0.001) %>% 
+dplyr::filter(!str_detect(Gene, "^Rpl")) %>% dplyr::filter(!str_detect(Gene, "^Rps")) 
+
+tex<- list(tex$Gene)
+
+cd8<- AddModuleScore(cd8, features = tex, name="Tex")
+
+wilcox.test(x = cd8[,cd8$dataset == "AlloSCT"]$Tex1, y = cd8[,cd8$dataset == "PTcy"]$Tex1)
+
+VlnPlot(cd8,features = "Tex1", pt.size=0, group.by = "dataset", cols = cd8_cols ,log = F, y.max = max(cd8$Tex1) +0.05, slot = "scale.data")+stat_summary(fun="mean", geom = "point")+stat_compare_means(comparisons = com, label = "p.format")
+```
+
+```{r Feature Plot CD8 Tex markers SCT}
+FeaturePlot(cd8, features = "Tex1", max.cutoff = "q95", min.cutoff = "q5", cols = c("lightgray", "firebrick2"), reduction = "wnn.umap")
+```
+
+```{r CD8 Tex markers Accessibility}
+cd8<- AddModuleScore(cd8, features = tex, name="Tex_Acc", assay = "GENE_ACC")
+
+wilcox.test(x = cd8[,cd8$dataset == "AlloSCT"]$Tex_Acc1, y = cd8[,cd8$dataset == "PTcy"]$Tex_Acc1)
+
+VlnPlot(cd8,features = "Tex_Acc1", pt.size=0, cols = cd8_cols, group.by = "dataset",log = F, y.max = max(cd8$Tex_Acc1) +0.05, slot = "scale.data")+stat_summary(fun="mean", geom = "point")+stat_compare_means(comparisons = com, label = "p.format")
+```
+
+```{r Feature Plot CD8 Tex markers Accessibility}
+FeaturePlot(cd8, features = "Tex_Acc1",  max.cutoff = "q95", min.cutoff = "q10", reduction = "wnn.umap")+ggtitle(label= "T-Cell Exhaustion Gene Activity")
+```
+
+```{r CD4 Tex markers SCT}
+DefaultAssay(cd4)<-"SCT"
+genes<- read.csv(file.path(DATA_DIR, "Tex_markers_shietinger.csv"))
+tex <- genes %>% dplyr::filter(log2FoldChange > 1) %>% dplyr::filter(pvalue < 0.001) %>% 
+dplyr::filter(!str_detect(Gene, "^Rpl")) %>% dplyr::filter(!str_detect(Gene, "^Rps")) 
+
+tex<- list(tex$Gene)
+
+cd4<- AddModuleScore(cd4, features = tex, name="Tex")
+
+wilcox.test(x = cd4[,cd4$dataset == "AlloSCT"]$Tex1, y = cd4[,cd4$dataset == "PTcy"]$Tex1)
+
+VlnPlot(cd4,features = "Tex1", pt.size=0, group.by = "dataset", cols = cd4_cols ,log = F, y.max = max(cd4$Tex1) +0.05, slot = "scale.data")+stat_summary(fun="mean", geom = "point")+stat_compare_means(comparisons = com, label = "p.format")
+```
+
+```{r Feature Plot cd4 Tex markers SCT}
+FeaturePlot(cd4, features = "Tex1", max.cutoff = "q95", min.cutoff = "q5", cols = c("lightgray", "firebrick2"), reduction = "wnn.umap")
+```
+
+```{r cd4 Tex markers Accessibility}
+cd4<- AddModuleScore(cd4, features = tex, name="Tex_Acc", assay = "GENE_ACC")
+
+wilcox.test(x = cd4[,cd4$dataset == "AlloSCT"]$Tex_Acc1, y = cd4[,cd4$dataset == "PTcy"]$Tex_Acc1)
+
+VlnPlot(cd4,features = "Tex_Acc1", pt.size=0, cols = cd4_cols, group.by = "dataset",log = F, y.max = max(cd4$Tex_Acc1) +0.05, slot = "scale.data")+stat_summary(fun="mean", geom = "point")+stat_compare_means(comparisons = com, label = "p.format")
+```
+
+```{r Feature Plot cd4 Tex markers Accessibility}
+FeaturePlot(cd4, features = "Tex_Acc1",  max.cutoff = "q95", min.cutoff = "q5", reduction = "wnn.umap")+ggtitle(label= "T-Cell Exhaustion Gene Activity")
+
+```
+
+```{r Cd8 Cytokine Receptor Gene Activity}
+DotPlot(cd8, assay = "GENE_ACC", features = c("Il7r", "Il18r1", "Il2ra","Ifngr1", "Il2rb" ,"Il21r"), group.by = "dataset", scale.by = "size")+coord_flip()+ggtitle(label = "Cd8 Cytokine Receptor Gene Activity")
+```
+
+```{r Cd4 Cytokine Receptor Gene Activity}
+DotPlot(cd4, assay = "GENE_ACC", features = c("Il7r", "Il18r1", "Il2ra","Ifngr1", "Il2rb" ,"Il21r"), group.by = "dataset", scale.by = "size")+coord_flip()+ggtitle(label = "Cd4 Cytokine Receptor Gene Activity")
+```
+
+```{r CD8 Chromvar Motif Activity}
+DefaultAssay(cd8)<-"chromvar"
+cd8<- ScaleData(cd8)
+
+Idents(cd8)<-"dataset"
+
+differential.activity <- FindAllMarkers(
+  object = cd8,
+  group.by = "dataset",
+  only.pos = TRUE,
+  mean.fxn = rowMeans,
+  fc.name = "avg_diff",
+  assay = "chromvar",
+  verbose = T
+)
+
+top_n<- differential.activity %>%
+    group_by(cluster) %>%
+    slice_min(n = 20, order_by = p_val)##returns most signif top  marker per cluster
+
+t<- c()
+for(i in 1:length(top_n$gene)){
+  t[i]<-cd8@assays$ATAC@motifs@motif.names[[top_n$gene[i]]]
+}
+
+top_n$TF <- t
+
+DoHeatmap(cd8, features = top_n$gene, group.colors =cd8_cols, group.by = "dataset", label=T)+scale_fill_gradientn(colors = h_cols)
+```
+
+```{r CD4 Chromvar Motif Activity}
+DefaultAssay(cd4)<-"chromvar"
+cd4<- ScaleData(cd4)
+
+Idents(cd4)<-"dataset"
+
+differential.activity <- FindAllMarkers(
+  object = cd4,
+  group.by = "dataset",
+  only.pos = TRUE,
+  mean.fxn = rowMeans,
+  fc.name = "avg_diff",
+  assay = "chromvar",
+  verbose = T
+)
+
+top_n<- differential.activity %>%
+    group_by(cluster) %>%
+    slice_min(n = 20, order_by = p_val)##returns most signif top  marker per cluster
+
+t<- c()
+for(i in 1:length(top_n$gene)){
+  t[i]<-cd4@assays$ATAC@motifs@motif.names[[top_n$gene[i]]]
+}
+
+top_n$TF <- t
+
+DoHeatmap(cd4, features = top_n$gene, group.colors =cd4_cols, group.by = "dataset", label=T)+scale_fill_gradientn(colors = h_cols)
+```
