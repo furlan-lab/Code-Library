@@ -1,0 +1,282 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+screen
+grabnode
+24
+480
+7
+N
+
+ml R/4.1.0-foss-2020b
+
+R
+
+```{R}
+rm(list=ls())
+
+suppressPackageStartupMessages({
+  # Plotting packages
+  library(viridis)
+  library(wesanderson)
+  library(RColorBrewer)
+  library(circlize)
+  library(ComplexHeatmap)
+  library(patchwork)
+  library(gplots)
+  library(grid)
+  library(ggplot2)
+  library(ggrepel)
+  library(ggrastr)
+  library(ggdendro)
+  library(ggthemes)
+  library(gghighlight)
+  
+  # Tidy data packages
+  
+  library(dplyr)
+  library(magrittr)
+  library(reshape2)
+  library(splitstackshape)
+  library(broom)
+  library(stringr)
+  library(binr)
+  library(tibbletime)
+  library(Matrix)
+
+  # Statistics packages
+  
+  library(e1071)
+  library(fclust)
+  
+  # Bioinformatics packages
+  
+  library(org.Hs.eg.db)
+  library(clusterProfiler)
+  library(SingleCellExperiment)
+  library(GenomicInteractions)
+  library(GenomicRanges)
+  library(motifmatchr)
+  library(TFBSTools)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  # library(URD)
+  library(Seurat)
+  library(xfun)
+  library(rhdf5)
+  library(Signac)
+  library(future)
+  library(EnsDb.Hsapiens.v86)
+  library(JASPAR2020)
+  library(ArchR)
+  library(parallel)
+  library(scCustomize)
+  library(SeuratObject)
+  library(Seurat)
+  library(foreach)
+  library(chromVAR)
+  library(chromVARmotifs)
+})
+
+set.seed(1234)
+
+#load ArchR project
+setwd("~/m2")
+m2<-loadArchRProject()
+
+#Load seurat object
+m2_seu<-readRDS("~/m2/m2.rds")
+
+library(future)
+plan()
+
+plan("multicore", workers = detectCores())
+plan()
+
+options(future.globals.maxSize = 360 * 1024 ^ 3) # for 50 Gb RAM
+
+##load hg38 gene tss range file, need to change if using mouse
+
+hg38TSSRanges <- readRDS("~/refTSS_hg38.rds")
+hg38TSSRanges$gene_name <- hg38TSSRanges$Gene_symbol
+hg38TSSRanges<- hg38TSSRanges[which(!is.na(hg38TSSRanges$gene_name))]
+```
+
+```{R}
+##get peak set from ArchR then normalize ATAC matrix with Signac standard workflow
+
+ATAC.se<- getMatrixFromProject(
+  ArchRProj = m2,
+  useMatrix = "PeakMatrix",
+  useSeqnames = NULL,
+  verbose = TRUE,
+  binarize = FALSE,
+  threads = getArchRThreads(),
+  logFile = createLogFile("getMatrixFromProject")
+)
+
+cts<-assays(ATAC.se)$PeakMatrix
+peak<-GRangesToString(getPeakSet(m2))
+rownames(cts)<-peak
+colnames(cts)<-gsub("#", "_", colnames(cts))
+atac<-CreateSeuratObject(counts = cts, assay = "ATAC", meta.data = data.frame(m2@cellColData))
+atac <- RunTFIDF(atac)
+atac <- FindTopFeatures(atac, min.cutoff = 'q0')
+atac <- RunSVD(atac)
+dim(atac)
+colnames(atac[["ATAC"]]@data)
+rownames(atac@meta.data)
+ranges<-getPeakSet(m2)
+names(ranges)<-NULL
+
+ATAC.se <- SummarizedExperiment(assays = list(counts = atac[["ATAC"]]@data) , rowRanges =ranges, colData = atac@meta.data)
+
+#important to save everything!
+saveRDS(ATAC.se, "~/m2/res/ATACse.rds")
+
+#ATAC.se<-readRDS("~/m2/res/ATACse.rds")
+
+RNAmat<- m2_seu[["RNA"]]@data %>% as.sparse()
+
+# run GenePeakcorr for dataset, will be used for 9Cl and IC_EWS analysis
+cisCor <- runGenePeakcorr(ATAC.se = ATAC.se,
+                           RNAmat = RNAmat,
+                           genome = "hg38",
+                          windowPadSize = 50000,
+                           nCores = detectCores(),
+                           n_bg = 100,
+                           p.cut = NULL)
+#write.csv(cisCor, file.path("~/m2/res/cisCOR_figR.csv"))
+#cisCor<- read.csv(file.path("~/m2/res/cisCOR_figR.csv"))
+```
+```{R}
+cisCor.filt <- cisCor %>% dplyr::filter(pvalZ <= 0.05)
+
+pdf("dorc_plot.pdf")
+dorcGenes <- dorcJplot(dorcTab = cisCor.filt,
+                       cutoff =4,
+                       returnGeneList = TRUE)
+dev.off()
+
+##the number of cutoffs depends on what the datalooks like. You want to select it when it curves up, almost
+##vertically
+
+sigGP <- cisCor.filt[cisCor.filt$Gene %in% dorcGenes,]
+
+rownames(RNAmat) <- gsub(x=rownames(RNAmat),pattern = "-",replacement = "",fixed = TRUE)
+
+dorcMat<- getDORCScores(ATAC.se, dorcTab = sigGP, geneList = dorcGenes)
+
+#get mulitome UMAP coordinates from archR project
+lsi <- m2@reducedDims@listData$mo@listData$matRD
+
+rownames(lsi)<- gsub("#", "_",rownames(lsi) )
+lsi <- lsi[which(rownames(lsi) %in% colnames(dorcMat)),]
+dorcMat <- dorcMat[,which(colnames(dorcMat) %in% rownames(lsi))]
+ATAC.se <- ATAC.se[, which(colnames(ATAC.se) %in% rownames(lsi))]
+RNAmat <- RNAmat[, which(colnames(RNAmat) %in% rownames(lsi))]
+
+
+lsi.knn <- FNN::get.knn(lsi,k=30)$nn.index
+rownames(lsi.knn) <- colnames(dorcMat)
+
+library(doParallel)
+dorcMat.smoothed <- smoothScoresNN(lsi.knn,dorcMat,nCores = detectCores())
+saveRDS(dorcMat.smoothed, file.path("~/m2/res/dorcMat_smoothed.rds"))
+
+
+rownames(dorcMat.smoothed)<- dorcGenes
+# Just so that the smoothing function will work, since it checks for matching attributes
+rownames(lsi.knn) <- colnames(RNAmat)
+
+# Run only on TFs to save time
+human_pwms_v3 <- readRDS("~/cisBP_human_pfms_2021.rds")
+rnaMat.smoothed <- smoothScoresNN(NNmat = lsi.knn,TSSmat = RNAmat,nCores = detectCores(),geneList=intersect(rownames(RNAmat),names(human_pwms_v3)))
+gc()
+
+saveRDS(rnaMat.smoothed , file.path("~/m2/res/rnaMat_smoothed.rds"))
+
+
+```
+
+
+
+#Load Everything & run FigR
+```{R}
+ATAC.se<-readRDS("~/m2/res/ATACse.rds")
+rnaMat.smoothed<- readRDS("~/m2/res/rnaMat_smoothed_9CL.rds")
+dorcMat.smoothed<- readRDS("~/m2/res/dorcMat_smoothed_9CL.rds")
+cisCor<-read.csv("~/m2/res/cisCOR_figR_9CL.csv")
+
+cisCor.filt <- cisCor %>% dplyr::filter(pvalZ <= 0.05)
+dorcGenes <- dorcJplot(dorcTab = cisCor.filt,
+                       cutoff =4,
+                       returnGeneList = TRUE)
+sigGP <- cisCor.filt[cisCor.filt$Gene %in% dorcGenes,]
+
+stim_FigR <- runFigR(ATAC.se = ATAC.se,
+                           dorcK = 20,
+                           dorcTab = sigGP,
+                           genome = "hg38", 
+                           dorcMat = dorcMat.smoothed,
+                           rnaMat = rnaMat.smoothed,
+                           n_bg = 50,
+                           nCores = detectCores())
+#write.csv(stim_FigR, "/Volumes/owaltner/m2/res/stim_figR_9CL.csv")
+```
+
+#ANALYSIS
+```{R}
+library(ggplot2)
+library(ggrastr)
+library(BuenColors)
+
+devtools::install_github("caleblareau/BuenColors")
+
+#change geom_text_repel parameters appropriately
+gAll <- ggplot(stim_FigR,aes(Corr.log10P,Enrichment.log10P,color=Score, label = Motif)) + 
+  geom_point_rast(size=0.01,shape=16) +
+  theme_classic() +
+  ylim(c(-3.5,6))+
+  theme(axis.text = element_text(size = 10), axis.title = element_text(size = 15))+
+  scale_color_gradientn(colours =  c("#5E4FA2", "#3288BD" ,"#66C2A5", "#ABDDA4"  ,"gray80", "#FDAE61", "#F46D43", "#D53E4F" ,"#9E0142"),limits=c(-2.5,2.5),oob = scales::squish)+
+  geom_text_repel(data = stim_FigR[abs(stim_FigR$Score) > 1.5 ,], size =4)
+
+
+# Mean plot
+library(ggrepel)
+
+filt<-stim_FigR[abs(stim_FigR$Score) > 1.3, ]
+filt<-na.omit(filt)
+
+rankDrivers(figR.d = filt) 
+rankDrivers(figR.d = stim_FigR) 
+
+
+
+plotfigRHeatmap(figR.d = stim_FigR,
+                             score.cut =1.2,
+                             column_names_gp=gpar(fontsize=8),
+                             show_row_dend = FALSE,
+                             column_names_side = "top",
+                             show_column_dend = F,
+                             cluster_rows = T,
+                             cluster_columns = T,
+                             column_names_rot = 45
+                             )
+
+
+unique(stim_FigR[which(stim_FigR$DORC %in% aynaud$Gene),]$DORC)
+unique(stim_FigR[which(stim_FigR$Motif %in% aynaud$Gene),]$Motif)
+
+# dorcs<-stim_FigR[stim_FigR$Motif == "HOXD13" & stim_FigR$Score > 0.9,]$DORC
+```
+
+```{R}
+# D3Network
+plotfigRNetwork(stim_FigR,score.cut = 0.65,DORCs = dorcs)
+
+
+```
