@@ -1,4 +1,6 @@
 
+###run locally
+
 source $HOME/.virtualenvs/reticulate/bin/activate
 
 pip install tables
@@ -12,10 +14,37 @@ pip install -e CellBender
 #cd to cell ranger outs folder
 
 
-cellbender remove-background \
+
+
+
+
+###run on cluster
+ml Python/3.8.6-GCCcore-10.2.0
+
+pip install tables
+
+pip3 install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cpu
+
+git clone https://github.com/broadinstitute/CellBender.git
+
+pip install -e CellBender
+
+cd /fh/fast/furlan_s/experiments/648_Tigitdata/data
+
+#cd to cell ranger outs folder
+samps=(648_Tigit_Gp1 648_Tigit_Gp2 648_Tigit_Gp3 648_Tigit_Gp4) #edit 
+export samps
+for samp in ${samps[@]}; do
+  export $samp
+  export path=/fh/fast/furlan_s/experiments/648_Tigitdata/data/${samp}/outs
+  cd $path
+  sbatch -n 1 -c 1 -p campus-new -M gizmo --gres=gpu --mem-per-cpu=16000MB --wrap='cellbender remove-background \
                  --input raw_feature_bc_matrix.h5 \
                  --output output.h5 \
                  --expected-cells 10000 \
+                 --cuda \
                  --total-droplets-included 20000 \
                  --fpr 0.01 \
-                 --epochs 150
+                 --epochs 150'
+done
+
