@@ -1,0 +1,21 @@
+
+source $HOME/.virtualenvs/reticulate/bin/activate
+
+pip install tables
+
+pip3 install torch torchvision torchaudio
+
+git clone https://github.com/broadinstitute/CellBender.git
+
+pip install -e CellBender
+
+#cd to cell ranger outs folder
+
+
+cellbender remove-background \
+                 --input raw_feature_bc_matrix.h5 \
+                 --output output.h5 \
+                 --expected-cells 10000 \
+                 --total-droplets-included 20000 \
+                 --fpr 0.01 \
+                 --epochs 150
