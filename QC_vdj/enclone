@@ -1,0 +1,7 @@
+ssh owaltner@rhino
+
+curl -sSf -L bit.ly/enclone_install | bash -s large
+
+enclone TCR=/fh/scratch/delete90/furlan_s/648_Tigit/648_Tigit_Gp1_VDJ,/fh/scratch/delete90/furlan_s/648_Tigit/648_Tigit_Gp2_VDJ,/fh/scratch/delete90/furlan_s/648_Tigit/648_Tigit_Gp3_VDJ,/fh/scratch/delete90/furlan_s/648_Tigit/648_Tigit_Gp4_VDJ POUT=output.csv NFOURSIE_KILL NDOUBLET PCELL NOPRINT
+
+mv output.csv /fh/fast/furlan_s/experiments/648_Tigitdata/data
