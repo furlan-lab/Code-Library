@@ -1,5 +1,7 @@
 # Excellent bioinformatics tutorials:
 
+[Setting up your local computer](http://sfurlan.com/wp/)
+
 [Intro to single cell RNA and ATAC](https://bookdown.org/ytliu13207/SingleCellMultiOmicsDataAnalysis/monocle2.html#load-seurat-obj)
 
 
