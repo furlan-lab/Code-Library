@@ -24,7 +24,7 @@ R
 
 3. Then copy and paste <a href="SetUp/SetUP.R">this file</a> into terminal
 
-4. Then go to here https://rstudio-launcher.fredhutch.org/
+4. Then go to [here](https://rstudio-launcher.fredhutch.org/)
 
 Make it look like this...
 
