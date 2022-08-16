@@ -1,3 +1,11 @@
+# Excellent bioinformatics tutorials:
+
+[Intro to single cell RNA and ATAC](https://bookdown.org/ytliu13207/SingleCellMultiOmicsDataAnalysis/monocle2.html#load-seurat-obj)
+
+
+
+
+
 # Getting Set up on the Cluster
 
 1. Get permission to rhino and furlan lab fast and scratch folders from SciComp
