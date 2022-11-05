@@ -17,7 +17,7 @@
 ```
 ssh fred_hutch_username@rhino
 
-ml fhR/4.1.2-foss-2021b
+ml fhR/4.2.0-foss-2021b
 
 R
 ```
@@ -28,7 +28,7 @@ R
 
 Make it look like this...
 
-<p align="left"><img src="SetUp/Screen Shot 2022-06-28 at 11.17.28 AM.png" alt="" width="500"></a></p>
+<p align="left"><img src="SetUp/launchla.png" alt="" width="500"></a></p>
 <hr>
 
 5. Refresh page and click on your gizmo link :)
