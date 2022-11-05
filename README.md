@@ -28,7 +28,7 @@ R
 
 Make it look like this...
 
-<p align="left"><img src="SetUp/launchla.png" alt="" width="500"></a></p>
+<p align="left"><img src="SetUp/launch.png" alt="" width="500"></a></p>
 <hr>
 
 5. Refresh page and click on your gizmo link :)
