@@ -10,7 +10,7 @@
 
 # Getting Set up on the Cluster
 
-1. Get permission to rhino and from SciComp
+1. Get permission to rhino from SciComp
 
 2. Run the following lines in terminal
 
