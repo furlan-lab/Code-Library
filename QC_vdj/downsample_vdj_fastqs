@@ -1,0 +1,50 @@
+##downsample fastqs to improve VDJ sequencing
+
+git clone https://github.com/lh3/seqtk.git;
+cd seqtk; make
+
+
+
+sFH2
+screen
+export id=648_Tigit                                               ##### CHANGE THESE
+export fq=/fh/scratch/delete90/furlan_s/demux/220624_VH00738_48_AAAN5GNHV/AAAN5GNHV/outs/fastq_path/AAAN5GNHV
+export wd=/fh/scratch/delete90/furlan_s/${id}/downsample_vdj
+mkdir $wd
+cd $wd
+samps=(648_Tigit_Gp1 648_Tigit_Gp2 648_Tigit_Gp3 648_Tigit_Gp4)  ##### CHANGE THESE
+
+ml seqtk
+ml R
+
+R
+
+fqs<-list.files("/fh/scratch/delete90/furlan_s/demux/220624_VH00738_48_AAAN5GNHV/AAAN5GNHV/outs/fastq_path/AAAN5GNHV")
+fqs<-fqs[grepl("VDJ", fqs)]
+
+wd<-"/fh/scratch/delete90/furlan_s/648_Tigit/downsample_vdj"
+i<-fqs[1]
+for(i in fqs){
+	input<-paste0("/fh/scratch/delete90/furlan_s/demux/220624_VH00738_48_AAAN5GNHV/AAAN5GNHV/outs/fastq_path/AAAN5GNHV/", i)
+	out<-paste0(wd, "/", i)
+	run<-sprintf("seqtk sample %s 0.25 > %s", input, out)
+	system(run)
+
+}
+
+export id=648_Tigit                                               ##### CHANGE THESE
+export fq=/fh/scratch/delete90/furlan_s/648_Tigit/downsample_vdj
+export wd=/fh/scratch/delete90/furlan_s/648_Tigit/downsample_cellranger
+mkdir $wd
+cd $wd
+samps=(648_Tigit_Gp1 648_Tigit_Gp2 648_Tigit_Gp3 648_Tigit_Gp4)  ##### CHANGE THESE
+
+for samp in ${samps[@]}; do
+export samp
+sbatch -n 1 -c 22 --mem-per-cpu=21000MB --wrap='/fh/fast/furlan_s/user/owalt/cellranger-7.0.0/cellranger vdj \
+                --id=${samp}_VDJ \
+                --reference=/shared/biodata/ngs/Reference/10X/refdata-cellranger-vdj-GRCm38-alts-ensembl-5.0.0 \
+                --fastqs=$fq \
+                --sample=${samp}_VDJ \
+                --localcores=12 --localmem=240'
+done
