@@ -8,7 +8,7 @@
 
 
 
-# Getting Set up on the Cluster
+# Getting set up on the cluster
 
 1. Get permission to rhino from SciComp
 
