@@ -3,19 +3,6 @@ output: html_document
 editor_options: 
   chunk_output_type: console
 ---
-screen
-
-grabnode
-18
-360
-7
-n
-
-ml R/4.1.0-foss-2020b
-ml MACS2
-R
----
-
 ```{r, warning=FALSE, message=FALSE, warning=FALSE, echo=F}
 
 quit("no")
@@ -70,7 +57,7 @@ plan()
 plan("multicore", workers = detectCores())
 plan()
 
-options(future.globals.maxSize = 360 * 1024 ^ 3) # for 50 Gb RAM
+options(future.globals.maxSize = 36000000 * 1024 ^ 3) # for 50 Gb RAM
 
 ```
 
