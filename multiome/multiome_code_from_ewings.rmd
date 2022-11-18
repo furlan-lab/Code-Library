@@ -11,14 +11,14 @@ rm(list=ls())
 
 #Load neccessary packages
 suppressPackageStartupMessages({
-  # library(monocle3)
-  # library(reticulate)
+  library(monocle3)
+  library(reticulate)
   library(openxlsx)  
   library(dplyr)
   library(Matrix)
   library(ggplot2)
   library(xfun)
-  # library(pals)
+  library(pals)
   library(rhdf5)
   library(RColorBrewer)
   library(Signac)
@@ -62,7 +62,6 @@ options(future.globals.maxSize = 36000000 * 1024 ^ 3) # for 50 Gb RAM
 ```
 
 #Make Object Seurat
-
 ```{bash Call Peaks on ATAC fragments}
 cd '/Users/owaltner/Fred Hutchinson Cancer Research Center/Ewings - General/experiments/EW4'
 

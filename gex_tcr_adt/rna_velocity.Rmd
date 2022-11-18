@@ -1,0 +1,101 @@
+---
+title: "RNA Velocity"
+output: html_notebook
+---
+```{bash}
+####DOWNLOAD VELOCYTO#####
+
+#ssh into rhino
+
+ml Python/3.8.6-GCCcore-10.2.0
+
+##activate virtual environment
+#if you haven't set it up go here http://sfurlan.com/wp/
+
+source $HOME/.virtualenvs/reticulate/bin/activate
+pip install Cython
+pip install velocyto
+pip install scanpy
+
+
+####VELOCYTO#####
+
+export id=648_Tigit_rerun                                    ##edit this
+samps=(648_Tigit_Gp1 648_Tigit_Gp2 648_Tigit_Gp3 648_Tigit_Gp4)  ##edit this
+
+export wd="/fh/fast/furlan_s/experiments/648_Tigitdata/velocyto" ##edit this
+
+##edit file paths in code below
+
+cd $wd
+for sample in ${samps[@]}; do
+export sample=$sample
+sbatch -n 1 -c 22 -p campus-new -M gizmo --mem-per-cpu=21000MB --wrap='velocyto run -vv -b /fh/scratch/delete90/furlan_s/648_Tigit_rerun/$sample/outs/per_sample_outs/$sample/count/sample_feature_bc_matrix/barcodes.tsv.gz -m /fh/fast/furlan_s/grp/refs/GRCm38/gencode_M24.gtf -o /fh/fast/furlan_s/experiments/648_Tigitdata/velocyto \
+-@ 22 /fh/scratch/delete90/furlan_s/648_Tigit_rerun/$sample/outs/per_sample_outs/$sample/count/sample_alignments.bam /shared/biodata/ngs/Reference/10X/refdata-gex-mm10-2020-A/genes/genes.gtf'
+done
+```
+
+```{r}
+##make sure the file path to umap model is correct
+##if you dont have this file run this 
+#i think this function is from m3addon / viewmastR
+#cds<-reduce_dimension(cds, reduction_method = "UMAP", umap.save_model = file.path(RES_DIR, "umap_model"))
+
+cds@reduce_dim_aux@listData[["UMAP"]]@listData[["model_file"]] <- file.path(RES_DIR, "umap_model")
+
+#prepare data into ann data object
+exprs <- t(assay(cds))
+col_data <- as.data.frame(colData(cds))
+row_data <- as.data.frame(rowData(cds))
+embedding <- reducedDim(cds, "UMAP")
+
+library(reticulate)
+Sys.setenv(RETICULATE_PYTHON = "/home/owaltner/.virtualenvs/reticulate/bin/python")
+py_config()
+
+#make your named cluster colors in R, will be exported to python
+clus_cols<-c("GzmA+ Tex" ="#df76a4", "GzmB+ Teff" = "#5ca867", "Tcm"="#336eae","Tex_Cycling" = "#ea9a50",  "Tigit+ Teff" = "#d0493d","Tim-3+ Tex" = "#7b5fa2",  "Tn" = "#88c7c0", "Transitionary_effector_cells"= "#4c9096")
+```
+
+```{python}
+import scanpy as sc
+
+adata_sce = sc.AnnData(X = r.exprs, obs = r.col_data, var = r.row_data)
+adata_sce.obsm['umap'] = r.embedding
+
+import scvelo as scv
+import os
+scv.set_figure_params()
+#there's definitely a smarter way to do this, but I haven't bothered
+#change file paths to where you made your looms
+filename = os.path.join("/Volumes/fh/fast/furlan_s/experiments/648_Tigitdata/velocyto/sample_alignments_5QEZN.loom")
+ldata = scv.read(filename, cache=True)
+ldata.var_names_make_unique()
+ldata.obs.index=ldata.obs.index.str.replace("sample_alignments_5QEZN:", "").str.replace("x", "-1")
+filename = os.path.join("/Volumes/fh/fast/furlan_s/experiments/648_Tigitdata/velocyto/sample_alignments_D64W4.loom")
+ldata2 = scv.read(filename, cache=True)
+ldata2.var_names_make_unique()
+ldata2.obs.index=ldata2.obs.index.str.replace("sample_alignments_D64W4:", "").str.replace("x", "-2")
+filename = os.path.join("/Volumes/fh/fast/furlan_s/experiments/648_Tigitdata/velocyto/sample_alignments_DQC6P.loom")
+ldata3 = scv.read(filename, cache=True)
+ldata3.var_names_make_unique()
+ldata3.obs.index=ldata3.obs.index.str.replace("sample_alignments_DQC6P:", "").str.replace("x", "-3")
+filename = os.path.join("/Volumes/fh/fast/furlan_s/experiments/648_Tigitdata/velocyto/sample_alignments_I2B8X.loom")
+ldata4 = scv.read(filename, cache=True)
+ldata4.var_names_make_unique()
+ldata4.obs.index=ldata4.obs.index.str.replace("sample_alignments_I2B8X:", "").str.replace("x", "-4")
+
+ldataC=ldata.concatenate(ldata2, ldata3, ldata4, join='inner', index_unique=None)
+
+adata=ldataC[adata_sce.obs.index].copy()
+adata.obsm['umap']=adata_sce.obsm['umap']
+adata.obs['cell_type']=adata_sce.obs['cell_type']
+scv.pp.filter_and_normalize(adata)
+scv.pp.moments(adata)
+scv.tl.velocity(adata, mode='stochastic')
+scv.tl.velocity_graph(adata)
+scv.pl.velocity_embedding_stream(adata, basis='umap', color="cell_type", smooth=0.4, min_mass=0, alpha=0.6, palette=r.clus_cols, legend_loc='none', arrow_size =2)
+```
+
+ 
+
