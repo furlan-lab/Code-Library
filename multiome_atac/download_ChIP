@@ -1,0 +1,140 @@
+#Fast QC
+#trim 
+#Fast QC 
+
+ml R
+ml SRA-Toolkit
+module load cutadapt
+module load TrimGalore
+module load FastQC
+
+mkdir fli_chip
+
+cd /fh/scratch/delete90/furlan_s/owalt/fli_chip
+
+R
+##CHP
+tab<-"/fh/scratch/delete90/furlan_s/owalt/fli_chip/sra.txt" 
+td<-read.delim(tab, sep = ",") 
+td$Run 
+system('fastq-dump -X 5 -Z SRR14760997')
+
+for(srr in td$Run){
+	command<-sprintf("sbatch -n 1 -c 1 -p campus-new -M gizmo --wrap='fastq-dump --split-files --gzip -O /fh/scratch/delete90/furlan_s/owalt/fli_chip/fastq %s'", srr)
+	system(command)
+}
+
+cd /fh/scratch/delete90/furlan_s/owalt/fli_chip/fastq
+
+R
+
+tab<-"/fh/scratch/delete90/furlan_s/owalt/fli_chip/sra.txt" 
+td<-read.delim(tab, sep = ",") 
+table(td$Cell_Line)
+
+to_use<-td[which(td$chip_antibody == "FLI1 (Abcam\\, ab15289\\, 2 µg)" & td$Cell_Line %in% c("A-673", "CHLA-10", "RD-ES", "SK-N-MC", "TC-32", "TC-71")),]
+
+path<-file.path("/fh/scratch/delete90/furlan_s/owalt/fli_chip/fastq", paste0(to_use$Run, "_1", ".fastq.gz"))
+file.exists(path)
+
+for(i in 1:length(path)){
+	out <- file.path("/fh/scratch/delete90/furlan_s/owalt/fli_chip/trim_fastq")
+	command<- sprintf("sbatch -n 1 -c 1 -p campus-new -M gizmo --wrap='trim_galore --fastqc --gzip --output_dir %s %s'", out, path[i]) 
+	system(command)
+}
+
+###
+#Build Bowie Genome Index, already did this so no need to do again
+
+cd "/fh/fast/furlan_s/grp/refs/GRCh38"
+
+module load Bowtie2/2.4.2-GCC-10.2.0
+
+bowtie2-build GRCh38.p13.genome.fa GRh38_Bowtie
+
+##
+#realign trimmed fastq files to bowtie index
+
+ml R
+ml SAMtools/1.10-GCCcore-8.3.0
+module load Bowtie2/2.4.1-GCCcore-8.3.0
+ml MACS2
+R
+
+
+tab<-"/fh/scratch/delete90/furlan_s/owalt/fli_chip/sra.txt" 
+td<-read.delim(tab, sep = ",") 
+table(td$Cell_Line)
+
+to_use<-td[which(td$chip_antibody == "FLI1 (Abcam\\, ab15289\\, 2 µg)" & td$Cell_Line %in% c("A-673", "CHLA-10", "RD-ES", "SK-N-MC", "TC-32", "TC-71")),]
+to_use$Cell_Line<-gsub("-", "", to_use$Cell_Line)
+
+apath<-file.path("/fh/scratch/delete90/furlan_s/owalt/fli_chip/trim_fastq", paste0(to_use$Run, "_1_trimmed.fq.gz"))
+file.exists(apath)
+aname<-paste0(to_use$Cell_Line, "_fli_chip", ".sam")
+
+
+for(i in 1:length(apath)){
+	command <- sprintf("sbatch -n 1 -c 1 -p campus-new -M gizmo --wrap='bowtie2 -x /fh/fast/furlan_s/grp/refs/GRCh38/bowtie2/GRh38_Bowtie -U %s -S %s'", apath[i], aname[i])
+	system(command)
+}
+
+apath<-file.path("/fh/scratch/delete90/furlan_s/owalt/fli_chip/sam", paste0(to_use$Cell_Line, "_fli_chip", ".sam"))
+file.exists(apath)
+aname<-paste0(to_use$Cell_Line, "_fli_chip", ".bam")
+
+for(i in 1:length(apath)){
+	command <- sprintf("sbatch -n 1 -c 1 -p campus-new -M gizmo --wrap='samtools view -bS %s > %s'", apath[i], aname[i])
+	system(command)
+}
+
+## remove duplicates (there is no duplicates in this example)
+## remove duplicates that have exactly the same start and end coordinates. most likely
+## due to PCR over-amplification
+## -s for single end; -S for paired-end
+
+apath<-file.path("/fh/scratch/delete90/furlan_s/owalt/fli_chip/bam", paste0(to_use$Cell_Line, "_fli_chip", ".bam"))
+file.exists(apath)
+aname<-paste0(to_use$Cell_Line, "_fli_chip_dedup", ".bam")
+
+for(i in 1:length(apath)){
+	command <- sprintf("sbatch -n 1 -c 4 -p campus-new -M gizmo --wrap='samtools rmdup -s %s %s'", apath[i], aname[i])
+	system(command)
+}
+
+
+## sort the bam by coordinates
+
+apath<-file.path("/fh/scratch/delete90/furlan_s/owalt/fli_chip/dedup", paste0(to_use$Cell_Line, "_fli_chip_dedup", ".bam"))
+file.exists(apath)
+aname<-paste0("sorted/", to_use$Cell_Line, "_fli_chip_depdup.sorted")
+
+for(i in 1:length(apath)){
+	command <- sprintf("sbatch -n 1 -c 5 -p campus-new -M gizmo --wrap='samtools sort -m 2G %s -o %s'", apath[i], aname[i])
+	system(command)
+}
+
+
+## index the bam
+apath<-file.path("/fh/scratch/delete90/furlan_s/owalt/fli_chip/sorted", paste0(to_use$Cell_Line, "_fli_chip_depdup.sorted"))
+file.exists(apath)
+aname<-paste0("index/", to_use$Cell_Line, "_fli_chip_index.bam")
+
+for(i in 1:length(apath)){
+	command <- sprintf("sbatch -n 1 -c 4 -p campus-new -M gizmo --wrap='samtools index %s'", apath[i])
+	system(command)
+}
+
+#call peaks
+## ~ 10mins to finish
+apath<-file.path("/fh/scratch/delete90/furlan_s/owalt/fli_chip/sorted", paste0(to_use$Cell_Line, "_fli_chip_depdup.sorted"))
+file.exists(apath)
+aname<-paste0(to_use$Cell_Line, "_fli_chip_peaks")
+
+for(i in 1:length(apath)){
+	command <- sprintf("sbatch -n 1 -c 4 -p campus-new -M gizmo --wrap='macs2 callpeak -t %s -f BAM --outdir macs2 -n %s'", apath[i], aname[i])
+	system(command)
+}
+
+
+
