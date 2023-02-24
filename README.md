@@ -10,7 +10,9 @@
 
 [sc Heatmap](https://divingintogeneticsandgenomics.rbind.io/post/enhancement-of-scrnaseq-heatmap-using-complexheatmap/)
 
-[Enhanced seurat plotting](https://samuel-marsh.github.io/scCustomize/)
+[Enhanced seurat plotting: scCustomize](https://samuel-marsh.github.io/scCustomize/)
+
+[Enhanced seurat plotting: scPubR](https://enblacar.github.io/SCpubr-book/)
 
 [TCR analysis](https://www.bioconductor.org/packages/release/bioc/vignettes/scRepertoire/inst/doc/vignette.html)
 
