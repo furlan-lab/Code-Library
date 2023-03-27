@@ -4,7 +4,7 @@
 
 [Intro to single cell RNA and ATAC](https://bookdown.org/ytliu13207/SingleCellMultiOmicsDataAnalysis/monocle2.html#load-seurat-obj)
 
-[Gene set enrichment](https://crazyhottommy.github.io/scRNA-seq-workshop-Fall-2019/scRNAseq_workshop_3.html)
+[Gene set enrichment](https://yulab-smu.top/biomedical-knowledge-mining-book/index.html)
 
 [Heatmap basics](https://jokergoo.github.io/ComplexHeatmap-reference/book/index.html)
 
