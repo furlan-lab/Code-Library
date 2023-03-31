@@ -7,7 +7,7 @@ install.packages('IRkernel')
 install.packages('remotes')
 install.packages(c("devtools", "rlist","heatmaply", "hdf5r", "tidyverse", 
                    "openxlsx", "prettydoc", "kableExtra", "piano", "pals", 
-                   "ClusterR", "mixtools","Cairo", "refGenome", "ggplot2", "RColorBrewer", "systemfonts", 'nloptr', 'pbmcapply', 'qlcMatrix'
+                   "ClusterR", "mixtools","Cairo", "refGenome", "ggplot2", "RColorBrewer", "systemfonts", 'nloptr', 'pbmcapply', 'qlcMatrix',
                   'parallel', 'stringr', 'viridis', 'tibble', 'dplyr', 'future', 'ggplot2', 'Matrix', 'xfun',"ggpubr", "hdf5r", "rliger"))
 if (!requireNamespace("BiocManager", quietly = TRUE))
   install.packages("BiocManager")
