@@ -32,6 +32,7 @@ devtools::install_github('cole-trapnell-lab/monocle3', ref = "develop")
 devtools::install_github('scfurl/m3addon')
 devtools::install_github('GreenleafLab/ArchR')
 ArchR::installExtraPackages()
+devtools::install_github("timoast/signac", ref = "develop", force = T)
 devtools::install_github("timoast/signac", ref = "develop")
 devtools::install_github('scfurl/seqGlue')
 devtools::install_github('scfurl/probedeeper')
@@ -46,13 +47,4 @@ devtools::install_github("slowkow/ggrepel")
 devtools::install_github("jokergoo/ComplexHeatmap")
 devtools::install_github("jokergoo/circlize")
 devtools::install_github("enblacar/SCpubr", ref = "v1.1.1-dev-stable")
-# Install the remotes package // dev version
-remotes::install_github(repo = 'satijalab/seurat', ref = 'develop')
-
-##Signac dev version
-if (!requireNamespace("devtools", quietly = TRUE))
-  install.packages("devtools")
-devtools::install_github("timoast/signac", ref = "develop", force = T)
-
-#FigR install (TF Motif analysis)
 remotes::install_github("buenrostrolab/FigR")
